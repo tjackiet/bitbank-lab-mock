@@ -77,6 +77,7 @@ export function stateChangeMessages(
   ];
 }
 
+/** 1 通ぶんのメッセージ。`params` は要素 1 つの配列にする（`PrivateStreamMessage` の docstring）。 */
 function message(method: PrivateStreamMethod, param: unknown): PrivateStreamMessage {
   return { message: { method, params: [param] } };
 }
@@ -101,6 +102,10 @@ function lastExecutedAtByOrder(trades: TradeRecord[]): Map<string, string> {
   return out;
 }
 
+/**
+ * 注文のメッセージ。`next` に初めて現れた注文は `spot_order_new`、見え方が変わった注文は
+ * `spot_order`。並びは `next.orders` の順。
+ */
 function orderMessages(prev: PaperState, next: PaperState): PrivateStreamMessage[] {
   // 注文も約定も同じ配列のままなら、どの注文の見え方も変わっていない。時計だけを動かす
   // 差し替え（`tick()` の末尾、`POST /_control/clock`）はここで抜ける。
@@ -127,6 +132,7 @@ function orderMessages(prev: PaperState, next: PaperState): PrivateStreamMessage
   return out;
 }
 
+/** 約定のメッセージ。`next` に初めて現れた trade を、記録順に `spot_trade` で。 */
 function tradeMessages(prev: PaperState, next: PaperState): PrivateStreamMessage[] {
   if (prev.trades === next.trades) return [];
   const seen = new Set(prev.trades.map((t) => t.tradeId));
@@ -135,6 +141,10 @@ function tradeMessages(prev: PaperState, next: PaperState): PrivateStreamMessage
     .map((t) => message("spot_trade", formatTrade(t)));
 }
 
+/**
+ * 資産のメッセージ。`GET /v1/user/assets` と同じ整形（`formatAssets()`）で見え方が変わった資産を、
+ * 1 資産 1 通の `asset_update` で。
+ */
 function assetMessages(
   prev: PaperState,
   next: PaperState,

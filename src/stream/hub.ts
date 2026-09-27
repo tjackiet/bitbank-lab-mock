@@ -100,6 +100,10 @@ export class PrivateStreamHub {
     return this.clients.size;
   }
 
+  /**
+   * store の差し替え 1 回を受け取る。reset なら全員を閉じ、それ以外は差からメッセージを作って
+   * 配信方針を通してから送る。
+   */
   private onStateChange(change: StateChange): void {
     if (this.clients.size === 0) return;
     if (change.kind === "reset") {
@@ -143,6 +147,7 @@ export class PrivateStreamHub {
     }
   }
 
+  /** 全員を閉じて外す（reset のとき）。閉じ損ねても外すので、以後は送らない。 */
   private closeAll(code: number, reason: string): void {
     const clients = [...this.clients];
     this.clients.clear();
