@@ -284,6 +284,17 @@ export const OFFICIAL_SUBSCRIBE_FIELDS: Record<string, FieldCheck> = {
  * `method: spot_order_new` のフィールド表（`private-stream.md:115-136`）。`spot_order` は
  * 「内容は `spot_order_new` と同一」（`private-stream.md:176`）なので同じ表を使う。
  *
+ * **写したのは英語版で、日本語版（`private-stream_JP.md:116-137`）とは 5 行の型が違う。**
+ * どちらかを正には選ばない（`docs/fidelity.md` の「private stream の注文ペイロード」に表がある）。
+ *
+ * ```
+ * canceled_at      EN number          JP number | undefined
+ * price            EN string          JP string | undefined（type = limit / stop_limit のときだけ）
+ * remaining_amount EN string | null   JP string
+ * start_amount     EN string | null   JP string
+ * expire_at        EN number | null   JP number
+ * ```
+ *
  * ```
  * average_price | string | avg executed price
  * canceled_at | number | canceled at unix timestamp (milliseconds)
@@ -307,11 +318,12 @@ export const OFFICIAL_SUBSCRIBE_FIELDS: Record<string, FieldCheck> = {
  * is_just_triggered | boolean | Just triggered
  * ```
  *
- * ここに写すのは**条件の付かない行**だけ。`canceled_at` / `executed_at` / `price` は Type 欄に
- * `| undefined` が付かないが、**本モックは REST と同じく値があるときだけ出す**
- * （`price` は指値だけ、`canceled_at` は取消済みだけ、`executed_at` は約定があるときだけ。
- * `docs/fidelity.md` の「private stream の注文ペイロード」）。その 3 つと `post_only` は
- * 下の `OFFICIAL_STREAM_ORDER_CONDITIONAL_FIELDS` に置き、出る条件は `streamOrderShape()` が持つ。
+ * ここに写すのは**本モックが常に出す行**。`executed_at` は英日どちらの表も `number` なので
+ * 常に出す（約定が無ければ `0`）。`price` / `canceled_at` は英語版の表では条件が付かないが、
+ * **日本語版の表と REST の表（英日とも）が条件付きと書くので、本モックは値があるときだけ出す**
+ * （`price` は指値だけ、`canceled_at` は取消済みだけ）。その 2 つと `post_only` は下の
+ * `OFFICIAL_STREAM_ORDER_CONDITIONAL_FIELDS` に置き、出る条件は `streamOrderShape()` が持つ。
+ * `expire_at` は英語版と REST の `number | null` を採る（日本語版の stream の表だけが `null` を許さない）。
  */
 export const OFFICIAL_STREAM_ORDER_FIELDS: Record<string, FieldCheck> = {
   average_price: isString,
@@ -326,13 +338,13 @@ export const OFFICIAL_STREAM_ORDER_FIELDS: Record<string, FieldCheck> = {
   type: isString,
   expire_at: isNumberOrNull,
   user_cancelable: isBoolean,
+  executed_at: isNumber,
   is_just_triggered: isBoolean,
 };
 
 /** 上の表のうち、本モックが条件付きで出す行（条件は `streamOrderShape()`）。 */
 export const OFFICIAL_STREAM_ORDER_CONDITIONAL_FIELDS: Record<string, FieldCheck> = {
   canceled_at: isNumber,
-  executed_at: isNumber,
   price: isString,
   post_only: isBoolean,
 };
@@ -349,7 +361,11 @@ export const OFFICIAL_STREAM_ORDER_STATUSES = [
 
 /**
  * `method: spot_trade` のフィールド表（`private-stream.md:245-261`）。`position_side` /
- * `profit_loss` / `interest`（いずれも `| undefined`、信用取引の項目）を除く全行。
+ * `profit_loss` / `interest`（信用取引の項目）を除く全行。
+ *
+ * **除いた 3 行は英日で型が違う**——英語版は `| undefined`、日本語版（`private-stream_JP.md:257,261-262`）は
+ * `| null`。本モックは REST の表（英日とも `| undefined`）と英語版に揃えてキーごと出さない
+ * （`docs/fidelity.md` の「信用取引・逆指値の項目」）。
  *
  * ```
  * amount | string | executed amount
@@ -428,16 +444,15 @@ export const OFFICIAL_ASSET_UPDATE_CAMEL_FIELDS: Record<string, FieldCheck> = {
 
 /**
  * stream の注文オブジェクトの期待形。REST の `orderShape()` と同じく、`type` と「取消済みか」
- * 「約定があるか」から出るはずのキー集合を組み立てる。
+ * から出るはずのキー集合を組み立てる。
  */
 export function streamOrderShape(
   actual: Record<string, unknown>,
-  expected: { type: "limit" | "market"; canceled: boolean; executed: boolean },
+  expected: { type: "limit" | "market"; canceled: boolean },
 ): { actual: OrderShapeResult; expected: OrderShapeResult } {
   const keys = Object.keys(OFFICIAL_STREAM_ORDER_FIELDS);
   if (expected.type === "limit") keys.push("price", "post_only");
   if (expected.canceled) keys.push("canceled_at");
-  if (expected.executed) keys.push("executed_at");
   return {
     actual: {
       type: actual.type,

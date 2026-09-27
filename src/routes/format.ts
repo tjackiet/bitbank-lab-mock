@@ -104,34 +104,47 @@ export function formatOrder(o: OrderRecord): OrderShape {
  * Fetch order information の表に対して足している 2 つを持つ。`spot_order` の内容は
  * 「`spot_order_new` と同一」と公式が明記するので（`private-stream.md:176`）、形は 1 つ。
  *
- * - `executed_at`: **その注文に約定があるときだけ出す。** 値は約定のうち最も遅い
- *   `executed_at`。公式は「最初・最後・直近のどれか」を書いておらず、約定の無い注文で
- *   何を返すかも書いていない（型は `number` で `| undefined` が付かないが、応答例の `0` は
- *   型の見本である）。`canceled_at` を取消時だけ出すのと同じ扱いにした
+ * - `executed_at`: **常に出す。** 約定があれば値はそのうち最も遅い約定時刻、**約定が無ければ
+ *   `0`**。英日どちらの表も型を `number`（`| undefined` も `| null` も付かない）と書くので
+ *   キーは省かない。`0` は応答例の値に合わせたもので、実 API が約定の無い注文に何を返すかは
+ *   確かめていない。公式は「最初・最後・直近のどの約定の時刻か」も書いていない
  *   （`docs/fidelity.md` の「private stream の注文ペイロード」）
  * - `is_just_triggered`: **常に `false`。** 逆指値のトリガという概念がこのモックに無いので、
  *   「たった今トリガされた」注文は存在しない（型は `boolean` で常に出る）
+ *
+ * `price` / `canceled_at` / `expire_at` の扱いは REST のまま変えない。**stream の表は英日で
+ * この 3 つの型が食い違う**が、どれも REST の表（英日とも）と stream の片方の言語版が
+ * 揃っている側に REST がすでに乗っている（同じ節に英日差の表がある）。
  *
  * REST と同じく `position_side` / `trigger_price` / `triggered_at` は出さない
  * （`docs/fidelity.md` の「信用取引・逆指値の項目」）。
  */
 export type StreamOrderShape = OrderShape & {
-  executed_at?: number;
+  executed_at: number;
   is_just_triggered: boolean;
 };
 
 /**
  * stream の注文オブジェクト。`lastExecutedAt` は呼び出し側がその注文の約定から引いて渡す
- * （`OrderRecord` は約定時刻を持たないので、ここでは導けない）。
+ * （`OrderRecord` は約定時刻を持たないので、ここでは導けない）。約定が無ければ `undefined`。
  */
 export function formatStreamOrder(
   o: OrderRecord,
   lastExecutedAt: string | undefined,
 ): StreamOrderShape {
-  const shape: StreamOrderShape = { ...formatOrder(o), is_just_triggered: false };
-  if (lastExecutedAt !== undefined) shape.executed_at = Date.parse(lastExecutedAt);
-  return shape;
+  return {
+    ...formatOrder(o),
+    executed_at: lastExecutedAt === undefined ? NO_EXECUTION_AT : Date.parse(lastExecutedAt),
+    is_just_triggered: false,
+  };
 }
+
+/**
+ * 約定の無い注文の `executed_at`。英日どちらの表も型を `number` と書く（省略も `null` も
+ * 許していない）ので、値を置く必要がある。**`0` は公式の応答例の値**で、実 API が何を返すかは
+ * 確かめていない（`docs/fidelity.md` の「private stream の注文ペイロード」）。
+ */
+const NO_EXECUTION_AT = 0;
 
 export type TradeShape = {
   trade_id: number | string;

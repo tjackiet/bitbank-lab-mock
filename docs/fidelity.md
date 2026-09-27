@@ -166,8 +166,9 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [パラメータの型強制](#パラメータの型強制) — `cancel_orders` の `order_ids` が id の非空配列でないとき、実 API は `40014` を返しますか
 - [同じ名前で複数来る値](#同じ名前で複数来る値) — 数値を取るクエリパラメータ（`count` など）を同名で 2 本送ったとき、実 API は断りますか、どちらかの値を採りますか
 - [private stream のメッセージ](#private-stream-のメッセージ) — 実 API は、1 つのメッセージの `params` に複数の要素を入れて送ることがありますか
-- [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 実 API の `spot_order_new` / `spot_order` は、約定していない注文にも `executed_at` を含めますか
+- [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 約定していない注文の `spot_order_new` / `spot_order` で、実 API は `executed_at` に何を返しますか
 - [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 実 API の注文ペイロードの `executed_at` は、最初の約定時刻と最後の約定時刻のどちらですか
+- [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 実 API の `spot_order_new` / `spot_order` は、取り消していない注文や成行注文でも `canceled_at` / `price` のキーを含めますか
 - [private stream の順序](#private-stream-の順序) — 実 API の private stream は、同じメッセージを重複して届けることがありますか
 - [private stream の `asset_update` のキー](#private-stream-の-asset_update-のキー) — 実 API の `asset_update` は、キーを snake_case（`free_amount`）と camelCase（`freeAmount`）のどちらで送りますか
 - [private stream の `spot_order_invalidation`](#private-stream-の-spot_order_invalidation) — 実 API の `spot_order_invalidation` の `params` は、オブジェクトと配列のどちらですか
@@ -188,7 +189,7 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 
 項目ごとに 1 小節。**「モックの挙動」が本文、残りの 4 列が箇条書き**である。v0.1.0 までは 1 項目 1 行の表だったが、1 行が 5,000 文字を超えて `grep` でも部分読みでも扱えなくなったため、内容を変えずに小節へ移した。
 
-**根拠の読み方**: 公式を根拠に引くときは、**フィールド表・JSON 応答例・本文の注記を全部突き合わせる。** 一致しないときは、**一致しないこと自体を記録する**——どちらかを正に選ばない。1 箇所だけを読んで断定した記述が実際に 3 件入り込んだ（注文ステータスの英日差を 1 つの節だけで判断した件、`asset_update` のキーを応答例だけで camelCase と断定した件、`spot_order_invalidation` の `params` を「公式通り配列」と書いた件。後の 2 件は下の該当節が持つ）。
+**根拠の読み方**: 公式を根拠に引くときは、**フィールド表・JSON 応答例・本文の注記を全部突き合わせる。英語版と日本語版の両方で。** 一致しないときは、**一致しないこと自体を記録する**——どちらかを正に選ばない。1 箇所だけを読んで断定した記述が実際に 4 件入り込んだ（注文ステータスの英日差を 1 つの節だけで判断した件、`asset_update` のキーを応答例だけで camelCase と断定した件、`spot_order_invalidation` の `params` を「公式通り配列」と書いた件、private stream の注文と約定の表を英語版だけで読み、日本語版も同じ条件だと書いた件。後の 3 件は下の該当節が持つ）。英日の表の食い違いは目で探すと見落とすので、**行ごとに機械的に突き合わせる**こと（4 件目はそれで見つかった）。
 
 **自分の中身を数えた数字を書かない**: 「小節は N ある」「N 節が推測を含む」のように、**項目を足すたびに
 古くなる書き方をしない**——値を更新しても次の追記でまた古くなるので、数を持たない書き方にする。
@@ -558,7 +559,7 @@ Plan A は maker / taker 表示に関わらず**単一の料率**で計算する
 
 ### 信用取引・逆指値の項目
 
-公式の応答表にあっても、本モックが機能を実装しないフィールドはキー自体を出さない。注文: `position_side` / `triggered_at` / `trigger_price`。約定: `position_side` / `profit_loss` / `interest`。private stream の `spot_order_new` / `spot_order` と `spot_trade` も同じ扱い（公式のフィールド表 `private-stream.md:125,127,133` / `:256,260-261` が同じ条件を書く）
+公式の応答表にあっても、本モックが機能を実装しないフィールドはキー自体を出さない。注文: `position_side` / `triggered_at` / `trigger_price`。約定: `position_side` / `profit_loss` / `interest`。private stream の `spot_order_new` / `spot_order` と `spot_trade` も同じ扱い。注文の 3 つは stream の表も英日とも `| undefined` で同じ条件を書く（`private-stream.md:125,127,133` / `private-stream_JP.md:126,128,134`）。**約定の 3 つは stream の表が英日で割れている**——英語版は `| undefined`（`private-stream.md:256,260-261`）、日本語版は `| null`（`private-stream_JP.md:257,261-262`）。本モックは REST の表（英日とも `| undefined`）と英語版に揃えてキーごと出さない
 
 - **根拠**: REST API の各応答表（`position_side` は「only for margin trading」、`triggered_at` / `trigger_price` は「present only if type = `stop`, `stop_limit`, `take_profit`, `stop_loss`」と条件が明記される）
 - **本物との差異**: `profit_loss` / `interest` は型が `string | undefined` とだけ書かれ、省略条件の明記が無い。信用取引の項目なので現物では出ないと判断した（**推測**）
@@ -880,15 +881,28 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream の注文ペイロード
 
-`spot_order_new` と `spot_order` は同じ形で、**REST の注文オブジェクト（`formatOrder()`）に `is_just_triggered` と `executed_at` を足したもの**。共通部分の値は同じ時点の `GET order` と一致する。`is_just_triggered` は**常に `false`**。`executed_at` は**約定があるときだけ**出し、値はその注文の約定のうち最も遅い `executed_at`。`price` / `post_only` / `canceled_at` が出る条件は REST と同じ（上の「注文の固定フィールド」節と「注文の `canceled_at`」節）。**新しく現れた注文は `spot_order_new`、既にあった注文の見え方が変わったら `spot_order`** で、1 回の変化につき 1 注文 1 通なので、**成行は `spot_order_new` が 1 通だけ、`status: "FULLY_FILLED"` で届く**（`UNFILLED` の `spot_order_new` は挟まない）
+`spot_order_new` と `spot_order` は同じ形で、**REST の注文オブジェクト（`formatOrder()`）に `executed_at` と `is_just_triggered` を足したもの**。共通部分の値は同じ時点の `GET order` と一致する。`is_just_triggered` は**常に `false`**。`executed_at` は**常に出し**、値はその注文の約定のうち最も遅い約定時刻、**約定が無ければ `0`**。`price` / `post_only` / `canceled_at` が出る条件と `expire_at: null` は REST と同じ（上の「注文の固定フィールド」節・「`expire_at`」節・「注文の `canceled_at`」節）。**新しく現れた注文は `spot_order_new`、既にあった注文の見え方が変わったら `spot_order`** で、1 回の変化につき 1 注文 1 通なので、**成行は `spot_order_new` が 1 通だけ、`status: "FULLY_FILLED"` で届く**（`UNFILLED` の `spot_order_new` は挟まない）
 
-- **根拠**: 公式のフィールド表（`private-stream.md:115-136` / `private-stream_JP.md:116-137`）。`spot_order` は「内容は `spot_order_new` と同一」（`private-stream.md:176` / `private-stream_JP.md:177`）。**`spot_order_new` の節の注記は、`FULLY_FILLED` / `CANCELED_*` の通知を受けたら手元の注文情報から消すよう書いており**（`private-stream.md:113` / `private-stream_JP.md:113`）、新規の通知が既に終端の状態で届くことを公式も想定している
-- **本物との差異**: **`executed_at` が「どの約定の時刻か」を公式は書いていない**（説明は "order executed at unix timestamp (milliseconds)" だけ）。型は `number` で `| undefined` が付かないが、応答例の `0` は型の見本で、約定の無い注文に何を返すかの根拠にならない——`canceled_at` を取消時だけ出すのと同じ扱いにした。**`is_just_triggered` はモックに逆指値のトリガという概念が無いので常に偽**（「たった今トリガされた」注文が存在しない）。成行で `UNFILLED` の `spot_order_new` を挟むかは確かめていない。`status` の enum（`private-stream.md:130`）は `REJECTED` を含まない 6 値で、互換ルートと `/_control/` から `REJECTED` へ到達する経路は無い（上の「注文状態」節）
+**フィールド表が英日で 5 行食い違う**（2026-09-27 に英日の表を機械的に突き合わせて見つけた）。REST の注文の表（英日とも）も並べると、モックがどちらに寄せたかが読める。
+
+| フィールド | stream の表（英） | stream の表（日） | REST の表（英日とも） | モック |
+| --- | --- | --- | --- | --- |
+| `canceled_at` | `number`（`private-stream.md:118`） | `number \| undefined`（`private-stream_JP.md:119`） | Cancel order だけが持ち、英 `number`（`rest-api.md:484`）/ 日 `number \| undefined`（`rest-api_JP.md:492`） | 取消済みのときだけ出す |
+| `price` | `string`（`:124`） | `string \| undefined`、limit / stop_limit のときだけ（`:125`） | `string \| undefined`、limit / stop_limit のときだけ（`rest-api.md:302` / `rest-api_JP.md:310`） | 指値のときだけ出す |
+| `remaining_amount` | `string \| null`（`:126`） | `string`（`:127`） | `string \| null` | 常に文字列 |
+| `start_amount` | `string \| null`（`:129`） | `string`（`:130`） | `string \| null` | 常に文字列 |
+| `expire_at` | `number \| null`（`:132`） | `number`（`:133`） | `number \| null`（`rest-api.md:307` / `rest-api_JP.md:315`） | 常に `null` |
+
+**どの行も、モックの値は英日のどちらかの stream の表と REST の表に合っている**（`remaining_amount` / `start_amount` は両方に合う）。どちらかの言語版を正に選んだのではなく、REST から変えていないだけである。**`executed_at` だけは英日とも `number`（`private-stream.md:120` / `private-stream_JP.md:121`）で食い違いが無い**ので、キーを省かない
+
+- **根拠**: 公式のフィールド表（`private-stream.md:115-136` / `private-stream_JP.md:116-137`）と、上の表の REST の行。`spot_order` は「内容は `spot_order_new` と同一」（`private-stream.md:176` / `private-stream_JP.md:177`）。**`spot_order_new` の節の注記は、`FULLY_FILLED` / `CANCELED_*` の通知を受けたら手元の注文情報から消すよう書いており**（`private-stream.md:113` / `private-stream_JP.md:113`）、新規の通知が既に終端の状態で届くことを公式も想定している
+- **本物との差異**: **約定の無い注文の `executed_at` の値（`0`）は応答例の値に合わせただけ**で、実 API が何を返すかは確かめていない。**「どの約定の時刻か」も公式は書いていない**（説明は "order executed at unix timestamp (milliseconds)" だけ）。**`is_just_triggered` はモックに逆指値のトリガという概念が無いので常に偽**（「たった今トリガされた」注文が存在しない）。成行で `UNFILLED` の `spot_order_new` を挟むかは確かめていない。上の表の 5 行は、実 API がどちらの言語版どおりに送るか確かめていない。`status` の enum（`private-stream.md:130`）は `REJECTED` を含まない 6 値で、互換ルートと `/_control/` から `REJECTED` へ到達する経路は無い（上の「注文状態」節）
 - **推測**: はい
-  - 確認先 **実 API**: 実 API の `spot_order_new` / `spot_order` は、約定していない注文にも `executed_at` を含めますか
+  - 確認先 **実 API**: 約定していない注文の `spot_order_new` / `spot_order` で、実 API は `executed_at` に何を返しますか
   - 確認先 **実 API**: 実 API の注文ペイロードの `executed_at` は、最初の約定時刻と最後の約定時刻のどちらですか
   - 確認先 **実 API**: 実 API で成行注文を出したとき、`spot_order_new` は `status` が `FULLY_FILLED` の 1 通だけで届きますか
-- **利用側への含意**: 注文の追跡は、`spot_order_new` が必ず `UNFILLED` で始まることを前提にしない（公式の注記どおり、終端の状態で届き得る）。`executed_at` の**有無**を約定の判定に使わず、`executed_amount` と `status` で判定する
+  - 確認先 **実 API**: 実 API の `spot_order_new` / `spot_order` は、取り消していない注文や成行注文でも `canceled_at` / `price` のキーを含めますか
+- **利用側への含意**: 注文の追跡は、`spot_order_new` が必ず `UNFILLED` で始まることを前提にしない（公式の注記どおり、終端の状態で届き得る）。**`executed_at` を約定の判定に使わない**（約定が無くても `0` が入る）——`executed_amount` と `status` で判定する。`canceled_at` / `price` のキーの有無、`expire_at` の `null` にも依存しない（英日の表で扱いが割れている）
 
 ### private stream の発火契機
 

@@ -154,8 +154,8 @@
 - [約定の固定フィールド](fidelity.md#約定の固定フィールド) — 一部のフィールドの文字列表記に桁を仮定しないこと
 - [private stream の `asset_update` のキー](fidelity.md#private-stream-の-asset_update-のキー) — **公式の表と例でキーの綴りが食い違い、
   既定の camelCase は推測である。** 両方の綴りを受けるパーサにし、`BITBANK_MOCK_STREAM_ASSET_KEYS` で切り替えて確かめること
-- [private stream の注文ペイロード](fidelity.md#private-stream-の注文ペイロード) — `executed_at` を出す条件と値の選び方が推測。
-  **成行の `spot_order_new` は `FULLY_FILLED` で届く**ので、新規の通知が `UNFILLED` で始まることを前提にしないこと
+- [private stream の注文ペイロード](fidelity.md#private-stream-の注文ペイロード) — **公式の表が英日で 5 行食い違う**（どちらにも寄せず REST の扱いのまま）。
+  約定の無い注文の `executed_at`（`0`）も推測。**成行の `spot_order_new` は `FULLY_FILLED` で届く**ので、新規の通知が `UNFILLED` で始まることを前提にしないこと
 
 ### 照合（Reconcile）の前提（基準 b）
 

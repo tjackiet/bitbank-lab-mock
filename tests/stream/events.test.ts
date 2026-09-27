@@ -50,10 +50,12 @@ describe("stateChangeMessages: 注文", () => {
     expect(methods(ms)).toEqual(["spot_order_new", "asset_update"]);
 
     const order = params(ms[0]);
-    const shape = streamOrderShape(order, { type: "limit", canceled: false, executed: false });
+    const shape = streamOrderShape(order, { type: "limit", canceled: false });
     expect(shape.actual).toEqual(shape.expected);
     expect(order.status).toBe("UNFILLED");
     expect(order.is_just_triggered).toBe(false);
+    // 英日どちらの表も executed_at を number（省略不可）と書くので、約定が無くても 0 で出す。
+    expect(order.executed_at).toBe(0);
     expect(OFFICIAL_STREAM_ORDER_STATUSES).toContain(order.status);
   });
 
@@ -61,8 +63,9 @@ describe("stateChangeMessages: 注文", () => {
     const prev = buildState();
     const { state: next, order } = withLimitBuy(prev);
     const streamed = params(stateChangeMessages(prev, next, OPTS)[0]);
-    const { is_just_triggered, ...rest } = streamed;
+    const { is_just_triggered, executed_at, ...rest } = streamed;
     expect(is_just_triggered).toBe(false);
+    expect(executed_at).toBe(0);
     expect(rest).toEqual(formatOrder(order));
   });
 
@@ -73,7 +76,7 @@ describe("stateChangeMessages: 注文", () => {
     expect(methods(ms)).toEqual(["spot_order", "spot_trade", "asset_update", "asset_update"]);
 
     const o = params(ms[0]);
-    const shape = streamOrderShape(o, { type: "limit", canceled: false, executed: true });
+    const shape = streamOrderShape(o, { type: "limit", canceled: false });
     expect(shape.actual).toEqual(shape.expected);
     expect(o.status).toBe("PARTIALLY_FILLED");
     expect(o.executed_at).toBe(Date.parse(T1));
@@ -101,7 +104,7 @@ describe("stateChangeMessages: 注文", () => {
     const ms = stateChangeMessages(prev, next, OPTS);
     expect(methods(ms)).toEqual(["spot_order_new", "spot_trade", "asset_update", "asset_update"]);
     const o = params(ms[0]);
-    const shape = streamOrderShape(o, { type: "market", canceled: false, executed: true });
+    const shape = streamOrderShape(o, { type: "market", canceled: false });
     expect(shape.actual).toEqual(shape.expected);
     expect(o.status).toBe("FULLY_FILLED");
     expect(o.executed_at).toBe(Date.parse(T));
@@ -113,7 +116,7 @@ describe("stateChangeMessages: 注文", () => {
     const ms = stateChangeMessages(prev, next, OPTS);
     expect(methods(ms)).toEqual(["spot_order", "asset_update"]);
     const o = params(ms[0]);
-    const shape = streamOrderShape(o, { type: "limit", canceled: true, executed: false });
+    const shape = streamOrderShape(o, { type: "limit", canceled: true });
     expect(shape.actual).toEqual(shape.expected);
     expect(o.status).toBe("CANCELED_UNFILLED");
     expect(o.canceled_at).toBe(Date.parse(T1));

@@ -1113,7 +1113,7 @@ const dates = new Set<string>([ymdJst(fromMs), ymdJst(toMs)]);
 |---|---|
 | 層 | 新規 `src/stream/`（`events.ts` = 状態の差 → メッセージ、`hub.ts` = 配信と `DeliveryPolicy`）。`SessionStore` は購読の口（`onStateChange()`）だけを持ち、stream を知らない。**`store → stream` / `store → routes` の辺は作らない**（11.1 の層の記録を崩さない） |
 | 整形 | `src/routes/format.ts` に `formatStreamOrder()` / `formatAsset()` / `formatAssetUpdate()` を足した。`spot_trade` は `formatTrade()` をそのまま使う（14.1 の (2) のとおり）。資産は `formatAssets()` の出力を写すだけにして、REST と stream で金額の文字列化が分かれないようにした |
-| 注文ペイロードの差（14.1 の (1)） | `executed_at` は約定があるときだけ出し、値は最も遅い約定時刻（`POST /_control/tick` は過去の足を流し直せるので、記録順と時刻順が食い違い得る）。`is_just_triggered` は常に `false`。14.1 の (2) の「分け方は未決」は、**`formatOrder()` を土台にして 2 つを足す**形で決めた |
+| 注文ペイロードの差（14.1 の (1)） | `executed_at` は常に出し、値は最も遅い約定時刻（`POST /_control/tick` は過去の足を流し直せるので、記録順と時刻順が食い違い得る）、約定が無ければ `0`（**当初は約定があるときだけ出していた**。16.5 で英日の表と突き合わせて直した）。`is_just_triggered` は常に `false`。14.1 の (2) の「分け方は未決」は、**`formatOrder()` を土台にして 2 つを足す**形で決めた |
 | `asset_update` のキー（3.4 で保留） | **既定 camelCase、`BITBANK_MOCK_STREAM_ASSET_KEYS=snake` で snake_case。** 公式が割れていて実測もできないので、利用側が両方の綴りで試せることを優先した。既定を camelCase にした推測は `docs/fidelity.md` の同名の節 |
 | `params` の要素数 | 常に 1。公式の例のコードが `params[0]` しか読まないため |
 | 並べ方 | 1 回の変化の中は注文 → 約定 → 資産。公式は順序を保証しないので、利用側に依存させない |
@@ -1159,3 +1159,33 @@ const dates = new Set<string>([ymdJst(fromMs), ymdJst(toMs)]);
   頻度が増えるので、15.2 の要判断事項 16（取得頻度）と合わせて決める
 - **`spot_order_invalidation`**（14.1 の (1)）。発生条件が起こり得ない
 - **PubNub のプロトコル互換**（3.4 の決定のまま）
+
+### 16.5 公式ドキュメントとの整合性の確認（2026-09-27）
+
+実装の直後に、送るメッセージを公式の表と**英日の両方で**突き合わせた。
+
+**公式の版は動いていない。** `bitbankinc/bitbank-api-docs` の `master` の先頭は、このモックが固定している
+`0badd680`（2026-09-11）のままだった。REST の側の突き合わせ（`docs/fidelity.md` の対応表と
+`tests/routes/official-fields.ts`）はそのまま有効である。
+
+**やり方。** 英日の `private-stream*.md` から `asset_update` / `spot_order_new` / `spot_trade` /
+`spot_order_invalidation` の表を行ごとに抜き出して英日を比べ、次にモックが実際に作るメッセージ
+（指値の発注・部分約定・部分約定後の取消・売りの発注・全量約定・成行）の全キーと型を、英日それぞれの表に
+当てた。目で読み比べると見落とすので、**表の行を機械的に突き合わせた**。
+
+**分かったこと。**
+
+| 項目 | 結果 |
+|---|---|
+| 表に無いキー | **1 つも出していない**（英日とも） |
+| 英日の表の食い違い | `spot_order_new` で 5 行（`canceled_at` / `price` / `remaining_amount` / `start_amount` / `expire_at`）、`spot_trade` で 3 行（`position_side` / `profit_loss` / `interest` が英 `\| undefined`・日 `\| null`）。`asset_update` と `spot_order_invalidation` の表は英日で一致（表と例の食い違いは既知） |
+| 英日のどちらにも合わない値 | **`executed_at` を約定の無い注文で省いていた 1 件だけ。** 英日とも `number` で省略を許していない。**直した**（常に出し、約定が無ければ `0`） |
+| 残る食い違い | 英日の表が割れている 8 行だけで、どれもモックの値は片方の言語版と REST の表（英日とも）に合う。どちらかを正に選ばず、`docs/fidelity.md` の「private stream の注文ペイロード」節と「信用取引・逆指値の項目」節に表として記録した |
+
+**14.1 の (2) の記述を 1 つ補う。** 同項は `spot_trade` の信用取引の 3 フィールドを「公式が `| undefined` と
+定義する」と書いたが、**これは英語版だけの話で、日本語版は `| null`** である。14.1 は調査の記録なので本文は
+書き換えず、ここに残す。16.2 の実装（キーごと出さない）は REST の表（英日とも `| undefined`）と英語版に
+揃えたもので、変えていない。
+
+**入れなかったもの。** 英日の表を CI で突き合わせる検査は足していない。公式の版を固定している限り表は
+動かず、固定する版を上げるときに一度流せば足りるためである（今回は `master` が固定の版と同じだったので上げていない）。
