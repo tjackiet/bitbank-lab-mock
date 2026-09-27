@@ -15,6 +15,7 @@ import { stubFetchCandles } from "../routes/helpers.ts";
 
 const T = "2026-01-01T00:00:00.000Z";
 
+/** 書き出さず、足も取りに行かない store。料率 0 にして拘束額を読みやすくする。 */
 function newStore(state: PaperState = buildState()) {
   return new SessionStore(state, {
     path: null,

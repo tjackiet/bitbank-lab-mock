@@ -80,8 +80,8 @@
   書き込みが効いているかの確かめ方は [`fidelity.md` の「状態の永続化」](fidelity.md#状態の永続化)にある
 - **失敗の見え方** — 実装済みのエンドポイントでも、**封筒に包まれない応答が返る経路がある**。
   どの経路がそうなるかは [`fidelity.md` の「封筒に包まれない応答」](fidelity.md#封筒に包まれない応答)にある
-- **push 受信** — **PubNub ではなく素の WebSocket** で配信する。market モードでは誰かが互換ルートを叩いたときにだけ
-  約定とイベントが起き（`GET /v1/user/subscribe` は状態を読まないので例外で、叩いても約定は進まない）、`POST /_control/reset` は接続を閉じる。順序の入れ替わりや重複を起こす手段は無い。
+- **push 受信** — **PubNub ではなく素の WebSocket** で配信する。market モードでは誰かが互換ルートか `/_control/` の fill / tick を叩いたときにだけ
+  約定とイベントが起き（互換ルートのうち `GET /v1/user/subscribe` は状態を読まないので例外で、叩いても約定は進まない）、`POST /_control/reset` は接続を閉じる。順序の入れ替わりや重複を起こす手段は無い。
   条件は [`fidelity.md` の「private stream の発火契機」](fidelity.md#private-stream-の発火契機)と
   [`fidelity.md` の「private stream と状態の初期化」](fidelity.md#private-stream-と状態の初期化)にある
 

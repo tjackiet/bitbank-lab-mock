@@ -25,7 +25,9 @@ function must<T>(r: { success: true; data: T } | { success: false; error: string
   return r.data;
 }
 
+/** メッセージ列のメソッド名だけを並べる（順序ごと比べるため）。 */
 const methods = (ms: PrivateStreamMessage[]) => ms.map((m) => m.message.method);
+/** 1 通の `params[0]`。`params` は常に要素 1 つ（`src/stream/events.ts`）。 */
 const params = (m: PrivateStreamMessage | undefined) =>
   m?.message.params[0] as Record<string, unknown>;
 
