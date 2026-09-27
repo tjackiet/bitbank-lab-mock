@@ -96,6 +96,43 @@ export function formatOrder(o: OrderRecord): OrderShape {
   return shape;
 }
 
+/**
+ * private stream の `spot_order_new` / `spot_order` が載せる注文オブジェクト。
+ *
+ * **REST の注文オブジェクト（`OrderShape`）のスーパーセット**で、公式のフィールド表
+ * （`private-stream.md:115-136` / `private-stream_JP.md:116-137`）が REST の
+ * Fetch order information の表に対して足している 2 つを持つ。`spot_order` の内容は
+ * 「`spot_order_new` と同一」と公式が明記するので（`private-stream.md:176`）、形は 1 つ。
+ *
+ * - `executed_at`: **その注文に約定があるときだけ出す。** 値は約定のうち最も遅い
+ *   `executed_at`。公式は「最初・最後・直近のどれか」を書いておらず、約定の無い注文で
+ *   何を返すかも書いていない（型は `number` で `| undefined` が付かないが、応答例の `0` は
+ *   型の見本である）。`canceled_at` を取消時だけ出すのと同じ扱いにした
+ *   （`docs/fidelity.md` の「private stream の注文ペイロード」）
+ * - `is_just_triggered`: **常に `false`。** 逆指値のトリガという概念がこのモックに無いので、
+ *   「たった今トリガされた」注文は存在しない（型は `boolean` で常に出る）
+ *
+ * REST と同じく `position_side` / `trigger_price` / `triggered_at` は出さない
+ * （`docs/fidelity.md` の「信用取引・逆指値の項目」）。
+ */
+export type StreamOrderShape = OrderShape & {
+  executed_at?: number;
+  is_just_triggered: boolean;
+};
+
+/**
+ * stream の注文オブジェクト。`lastExecutedAt` は呼び出し側がその注文の約定から引いて渡す
+ * （`OrderRecord` は約定時刻を持たないので、ここでは導けない）。
+ */
+export function formatStreamOrder(
+  o: OrderRecord,
+  lastExecutedAt: string | undefined,
+): StreamOrderShape {
+  const shape: StreamOrderShape = { ...formatOrder(o), is_just_triggered: false };
+  if (lastExecutedAt !== undefined) shape.executed_at = Date.parse(lastExecutedAt);
+  return shape;
+}
+
 export type TradeShape = {
   trade_id: number | string;
   order_id: number | string;
@@ -190,24 +227,91 @@ export function formatAssets(
   ]);
   const assets: AssetShape[] = [];
   for (const a of assetSet) {
-    const digits = assetPrecision(a);
-    const amounts = assetAmounts(amountOf(state.balances, a), amountOf(locked, a), digits);
-    assets.push({
-      asset: a,
-      free_amount: amounts.free,
-      amount_precision: digits,
-      onhand_amount: amounts.onhand,
-      locked_amount: amounts.locked,
-      withdrawing_amount: formatUnits(0n, digits),
-      withdrawal_fee: withdrawalFee(a, digits),
-      stop_deposit: false,
-      stop_withdrawal: false,
-      // 公式の network_list は jpy でだけ undefined になる。キー自体を出さない。
-      ...(a === JPY ? {} : { network_list: [] }),
-      collateral_ratio: COLLATERAL_RATIO,
-    });
+    assets.push(formatAsset(a, amountOf(state.balances, a), amountOf(locked, a)));
   }
   return { assets };
+}
+
+/**
+ * 資産 1 つぶんの応答オブジェクト。`formatAssets()` の 1 要素と同じものを、残高と拘束額から作る。
+ *
+ * **private stream も同じ関数を通す**（`asset_update` は `formatAssets()` の出力から作り、
+ * 一覧から消えた資産だけはここへ `0` を渡して作る）。REST と stream で桁や切り捨ての規則が
+ * 分かれないよう、金額の文字列化はこの 1 か所にしか置かない。
+ */
+export function formatAsset(asset: string, onhand: number, locked: number): AssetShape {
+  const digits = assetPrecision(asset);
+  const amounts = assetAmounts(onhand, locked, digits);
+  return {
+    asset,
+    free_amount: amounts.free,
+    amount_precision: digits,
+    onhand_amount: amounts.onhand,
+    locked_amount: amounts.locked,
+    withdrawing_amount: formatUnits(0n, digits),
+    withdrawal_fee: withdrawalFee(asset, digits),
+    stop_deposit: false,
+    stop_withdrawal: false,
+    // 公式の network_list は jpy でだけ undefined になる。キー自体を出さない。
+    ...(asset === JPY ? {} : { network_list: [] }),
+    collateral_ratio: COLLATERAL_RATIO,
+  };
+}
+
+/**
+ * private stream の `asset_update` のキーの綴り。**公式が同じ節の中で割れている**
+ * （フィールド表は snake_case、JSON 応答例は camelCase。英日とも同じ構造）ので、
+ * どちらでも送れるようにしてある。既定は `camel`（`BITBANK_MOCK_STREAM_ASSET_KEYS`。
+ * 理由は `docs/fidelity.md` の「private stream の `asset_update` のキー」）。
+ */
+export type AssetKeyStyle = "camel" | "snake";
+
+/** `asset_update` の 1 要素（snake_case の綴り）。公式のフィールド表の 6 行そのもの。 */
+export type AssetUpdateSnakeShape = {
+  asset: string;
+  amount_precision: number;
+  free_amount: string;
+  locked_amount: string;
+  onhand_amount: string;
+  withdrawing_amount: string;
+};
+
+/** `asset_update` の 1 要素（camelCase の綴り）。公式の JSON 応答例のキーそのもの。 */
+export type AssetUpdateCamelShape = {
+  asset: string;
+  amountPrecision: number;
+  freeAmount: string;
+  lockedAmount: string;
+  onhandAmount: string;
+  withdrawingAmount: string;
+};
+
+/**
+ * REST の資産オブジェクトから `asset_update` の 1 要素を作る。値は**写すだけ**で計算しない
+ * （`GET /v1/user/assets` と同じ時点の状態なら、同じ文字列が出る）。
+ */
+export function formatAssetUpdate(
+  a: AssetShape,
+  keys: AssetKeyStyle,
+): AssetUpdateSnakeShape | AssetUpdateCamelShape {
+  if (keys === "snake") {
+    return {
+      asset: a.asset,
+      amount_precision: a.amount_precision,
+      free_amount: a.free_amount,
+      locked_amount: a.locked_amount,
+      onhand_amount: a.onhand_amount,
+      withdrawing_amount: a.withdrawing_amount,
+    };
+  }
+  return {
+    asset: a.asset,
+    amountPrecision: a.amount_precision,
+    freeAmount: a.free_amount,
+    lockedAmount: a.locked_amount,
+    onhandAmount: a.onhand_amount,
+    withdrawingAmount: a.withdrawing_amount,
+  };
 }
 
 /**

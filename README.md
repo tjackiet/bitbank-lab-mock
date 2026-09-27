@@ -16,7 +16,7 @@
 
 ## これは何
 
-bitbank Private REST API と同じパスで、**発注・約定・取消・注文照会・残高照会**ができるモックサーバです。どれも 1 つの状態（注文・約定・仮想残高）を共有しているので、発注すると残高が拘束され、約定すると約定履歴と残高に反映され、取り消すと拘束が外れます。固定の応答を返すスタブではありません。状態はファイルに書き出し、再起動後も引き継ぎます（書き出しに失敗したときの扱いは「[環境変数](#環境変数)」節）。
+bitbank Private REST API と同じパスで、**発注・約定・取消・注文照会・残高照会**ができるモックサーバです。どれも 1 つの状態（注文・約定・仮想残高）を共有しているので、発注すると残高が拘束され、約定すると約定履歴と残高に反映され、取り消すと拘束が外れます。固定の応答を返すスタブではありません。状態の変化は **private stream**（WebSocket）でも push で受け取れます（下の「[private stream](#private-stream)」節）。状態はファイルに書き出し、再起動後も引き継ぎます（書き出しに失敗したときの扱いは「[環境変数](#環境変数)」節）。
 
 発注から約定、残高の変化までの一連は [`examples/scenario-plan-a.sh`](examples/scenario-plan-a.sh) で確かめられます。何がどこまでできるかを根拠つきで確かめるなら [`docs/plan-a-readiness.md`](docs/plan-a-readiness.md) の「2. このモックで何ができるか」を読んでください。
 
@@ -31,8 +31,9 @@ bitbank Private REST API と同じパスで、**発注・約定・取消・注�
 
 ### 無いもの
 
-- **private stream**: 約定や注文の変化を push で受け取る口はまだありません。注文の状態は `POST /v1/user/spot/orders_info` で問い合わせて照合してください
-- **認証ヘッダの検証**: どんなヘッダでも、無くても通ります。本物の API キーを向けないでください
+- **PubNub**: private stream は PubNub ではなく素の WebSocket で配信します。PubNub SDK のままでは繋がりません（下の「[private stream](#private-stream)」節）
+- **private stream の障害注入**: 順序の入れ替わり・重複・欠落は起こせません。モックは常に発生順に 1 回ずつ届けます（公式は順序を保証しません）
+- **認証ヘッダの検証**: どんなヘッダでも、無くても通ります。private stream の接続も同じです。本物の API キーを向けないでください
 - **レート制限**: どれだけ叩いても 429（`10009`）は返りません
 - **注文訂正**: 発注後に価格や数量を変える口はありません
 
@@ -40,7 +41,7 @@ bitbank Private REST API と同じパスで、**発注・約定・取消・注�
 
 ### Plan A とは
 
-**Plan A** は [`docs/plan-lab-mock.md`](docs/plan-lab-mock.md) が定める**計画の段階名**で、リリースの版数ではありません。計画文書と `docs/fidelity.md` に出てくる `R` と `Phase` の番号は、それぞれ計画側の要件番号と着手の順です。たとえば private stream は要件 `R4` にあたり、`Phase 5` で着手する予定です。README ではどちらの番号も使いません。
+**Plan A** は [`docs/plan-lab-mock.md`](docs/plan-lab-mock.md) が定める**計画の段階名**で、リリースの版数ではありません。計画文書と `docs/fidelity.md` に出てくる `R` と `Phase` の番号は、それぞれ計画側の要件番号と着手の順です。たとえば private stream は要件 `R4` にあたり、`Phase 5` として実装しました。README ではどちらの番号も使いません。
 
 ### どのリビジョンを渡すか
 
@@ -65,6 +66,7 @@ bitbank Private REST API に対応する互換ルートは次のとおりです�
 | `POST` | `/v1/user/spot/cancel_order` | `pair` / `order_id` |
 | `POST` | `/v1/user/spot/cancel_orders` | `pair` / `order_ids`（1 件以上 30 件以下） |
 | `GET` | `/v1/user/assets` | なし |
+| `GET` | `/v1/user/subscribe` | なし（ダミーの `pubnub_channel` / `pubnub_token` を返す。「[private stream](#private-stream)」節） |
 
 **この表はパラメータの名前までで、契約そのものではありません。** 値をどう解釈するか・何を返すか・どの入力をどの error code で断るかの正は [`docs/fidelity.md`](docs/fidelity.md) です。本物との差分の記録であると同時に、**このモックの契約書でもあります**。読む順は同ファイルの「[v0.1.0 からの改訂](docs/fidelity.md#v010-からの改訂)」で今の版を把握してから、対応表の該当する節へ。
 
@@ -74,7 +76,42 @@ bitbank Private REST API に対応する互換ルートは次のとおりです�
 
 **`trade_history` は `from_id` / `end_id` を持ちません**（公式 `rest-api.md` のパラメータ表に無いため。送られても黙って無視します。実 API は絞り込みに使うので、同じ要求で結果が変わります。経緯は [`docs/fidelity.md`](docs/fidelity.md) の「絞り込みパラメータの不正値」の節）。
 
-実際に叩く例は [`examples/scenario-plan-a.sh`](examples/scenario-plan-a.sh) にあります。`/_control/` の経路は下の「[`/_control/`](#_control)」節です。
+実際に叩く例は [`examples/scenario-plan-a.sh`](examples/scenario-plan-a.sh) にあります。`/_control/` の経路は下の「[`/_control/`](#_control)」節、private stream は「[private stream](#private-stream)」節です。
+
+## private stream
+
+注文・約定・残高の変化を push で受け取る口です。**PubNub ではなく素の WebSocket** で、接続先は `ws://<host>:<port>/_stream/private`（互換ルートと同じアドレスとポート）です。
+
+```bash
+# Node.js 22 以降（グローバルの WebSocket を使う）。Node.js 20 なら `ws` パッケージで同じことができます
+node -e 'const ws = new WebSocket("ws://127.0.0.1:14000/_stream/private"); ws.onmessage = (e) => console.log(e.data)'
+```
+
+1 フレームに公式と同じ形の JSON が 1 つ届きます。
+
+```json
+{"message":{"method":"spot_order_new","params":[{"order_id":1,"pair":"btc_jpy","status":"UNFILLED","is_just_triggered":false,"...":"..."}]}}
+```
+
+| `method` | いつ届くか | 中身 |
+| --- | --- | --- |
+| `spot_order_new` | 注文が新しく現れたとき | 注文オブジェクト（REST の注文に `executed_at` と `is_just_triggered` を足したもの） |
+| `spot_order` | 既にある注文の状態が変わったとき（約定・取消） | 同上 |
+| `spot_trade` | 約定したとき | `trade_history` と同じ約定オブジェクト |
+| `asset_update` | 残高か拘束額が変わったとき | 変わった資産 1 つ（キーは既定で camelCase。`BITBANK_MOCK_STREAM_ASSET_KEYS=snake` で snake_case） |
+
+`spot_order_invalidation` は送りません（発生条件の「マッチングエンジン内の資産不足」がこのモックでは起こり得ないため）。
+
+知っておいてほしい点:
+
+- **接続した時点の状態は送りません。** 接続の後の変化だけが届くので、接続してから REST で取り直して突き合わせてください
+- **`GET /v1/user/subscribe` の `pubnub_channel` / `pubnub_token` はダミーです。** 接続では見ません。期限切れも起きません
+- **いつ届くかはモック固有です。** `manual` モードでは互換ルートの発注・取消と `/_control/` の操作でだけ届きます。`market` モードでは誰かが互換ルートを叩いたとき（読み取りでも）に約定とイベントが起きます。裏で市場を見張ってはいないので、**何も叩かなければ何も届きません**
+- **HTTP の応答より先に届くことがあります。** 状態がメモリに反映された直後に送るためで、書き出しに失敗して `70001` を返した発注のイベントも流れます
+- **`POST /_control/reset` は接続を close code `1012` で閉じます。** reset で注文 id が 1 から配り直されるためです。繋ぎ直して、手元の注文の対応表を REST で取り直してください
+- クライアントから送ったものは読みません（1024 バイトを超えるフレームは close code `1009` で閉じます）。upgrade でない `GET /_stream/private` には `426` を返します
+
+どこまで本物と同じか・どこを推測で決めたかは [`docs/fidelity.md`](docs/fidelity.md) の「[private stream](docs/fidelity.md#private-stream)」節から始まる一連の節にあります。
 
 ## `mock-bitbankcc` との棲み分け
 
@@ -116,6 +153,7 @@ BITBANK_MOCK_CONTROL=1 npm run dev
 | `BITBANK_MOCK_HOST` | control 有効時 `127.0.0.1`、無効時 `0.0.0.0` | listen アドレス |
 | `BITBANK_MOCK_PORT` | `14000` | listen ポート |
 | `BITBANK_MOCK_CONTROL_TOKEN` | 未設定 | 非ループバックからの `/_control/` に必要な `X-Control-Token` |
+| `BITBANK_MOCK_STREAM_ASSET_KEYS` | `camel` | private stream の `asset_update` のキーの綴り。`snake` のときだけ snake_case（`free_amount`）、それ以外は camelCase（`freeAmount`）。公式の表と例が食い違っているので、両方でパーサを試せるようにしてある |
 | `BITBANK_MOCK_PERSIST_FAILURE` | `degrade` | 状態ファイルへの書き出しに失敗した後の挙動。`degrade` は状態を変える要求を断り読み取りは生かす。`ignore` は v0.1.0 の挙動（何も断らない） |
 | `BITBANK_MOCK_STATE_PATH` | `~/.bitbank-mock/sessions/default/state.json` | 状態ファイルのパス |
 | `BITBANK_MOCK_HOME` | `~/.bitbank-mock` | `STATE_PATH` 未指定時のルート |
@@ -149,7 +187,7 @@ bitbank API には存在しません。本番クライアントから叩かな�
 | `POST` | `/_control/orders/:order_id/fill` | 指定注文を約定。`amount` 省略は残量全部、`price` 省略は指値 |
 | `POST` | `/_control/tick` | `{ pair, price }` または `{ pair, candle }` で人工の足を 1 本適用 |
 | `POST` | `/_control/clock` | 時計（`lastTickAt`）を動かす。本文省略で現在時刻、`{ lastTickAt }` に ISO 文字列かエポックミリ秒。注文・約定・残高は残る（`updatedAt` は書き込み時刻として動きます） |
-| `POST` | `/_control/reset` | 状態を初期化 |
+| `POST` | `/_control/reset` | 状態を初期化（private stream の接続は close code `1012` で閉じる） |
 | `GET` | `/_control/state` | `PaperState` に、状態ファイルへの書き出しの状況（`persist`）と足の取得の状況（`candles`）を添えて返す |
 
 **市場モード（`BITBANK_MOCK_FILL_MODE=market`）で足が取れているかは `GET /_control/state` の `candles` で確かめます。** 取得に失敗しても互換ルートは成功応答を返し続け、失敗した窓は取り直さないので、**約定が無いことだけからは「価格が注文に届いていない」と「足の取得に失敗している」を区別できません**。`lastError`（直近の失敗。成功しても消えません）、`consecutiveFailures`（連続失敗数。今まさに失敗し続けているか）、`lastSuccessAt`（いつまで足が取れていたか。`lastTickAt` と並べて読みます）、`fillMode`（`manual` なら `tick()` はそもそも取りに行きません）を見てください。詳細は [`docs/fidelity.md`](docs/fidelity.md) の「足の取得の健全性」の節にあります。
@@ -162,8 +200,8 @@ bitbank API には存在しません。本番クライアントから叩かな�
 
 - 公式 testnet / 動作保証 / 全 error code の網羅
 - 認証ヘッダの検証、レート制限、注文訂正
-- ダッシュボード、public REST の網羅、private stream
-- 障害注入（重複・順序入替）
+- ダッシュボード、public REST の網羅、PubNub での配信
+- 障害注入（private stream の重複・順序入替・欠落を含む）
 
 計画の詳細は [`docs/plan-lab-mock.md`](docs/plan-lab-mock.md) です。
 

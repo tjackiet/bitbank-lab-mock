@@ -260,3 +260,203 @@ export function tradeShape(actual: Record<string, unknown>): {
     expected: { keys: Object.keys(OFFICIAL_TRADE_FIELDS).sort(), badTypes: [] },
   };
 }
+
+// ---------------------------------------------------------------------------
+// private stream（`private-stream.md`、同じコミット 0badd680）
+//
+// REST の表とは**別の節の別の表**なので、形が同じでも独立に写す（一方だけが変わりうる）。
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /v1/user/subscribe`（`rest-api.md:1790-1793`、"Get channel and token for private stream"）。
+ *
+ * ```
+ * pubnub_channel | string | channel name
+ * pubnub_token | string | token
+ * ```
+ */
+export const OFFICIAL_SUBSCRIBE_FIELDS: Record<string, FieldCheck> = {
+  pubnub_channel: isString,
+  pubnub_token: isString,
+};
+
+/**
+ * `method: spot_order_new` のフィールド表（`private-stream.md:115-136`）。`spot_order` は
+ * 「内容は `spot_order_new` と同一」（`private-stream.md:176`）なので同じ表を使う。
+ *
+ * ```
+ * average_price | string | avg executed price
+ * canceled_at | number | canceled at unix timestamp (milliseconds)
+ * executed_amount | string | qty executed
+ * executed_at | number | order executed at unix timestamp (milliseconds)
+ * order_id | number | order ID
+ * ordered_at | number | ordered at unix timestamp (milliseconds)
+ * pair | string | pair enum: [pair list](pairs.md)
+ * price | string | order price
+ * trigger_price | string \| undefined | trigger price(present only if type = `stop`, ...)
+ * remaining_amount | string \| null | qty not executed
+ * position_side | string \| undefined | `long` or `short`(only for margin trading)
+ * side | string | `buy` or `sell`
+ * start_amount | string \| null | order qty when placed
+ * status | string | status enum: `INACTIVE`, `UNFILLED`, `PARTIALLY_FILLED`, `FULLY_FILLED`, `CANCELED_UNFILLED`, `CANCELED_PARTIALLY_FILLED`
+ * type | string | one of `limit`, `market`, `stop`, `stop_limit`, `take_profit`, `stop_loss`, `losscut`
+ * expire_at | number \| null | expiration time in unix timestamp (milliseconds)
+ * triggered_at | number \| undefined | triggered at ... (present only if type = `stop`, ...)
+ * post_only | boolean \| undefined | whether Post Only or not (present only if type = `limit`)
+ * user_cancelable | boolean | User cancelable
+ * is_just_triggered | boolean | Just triggered
+ * ```
+ *
+ * ここに写すのは**条件の付かない行**だけ。`canceled_at` / `executed_at` / `price` は Type 欄に
+ * `| undefined` が付かないが、**本モックは REST と同じく値があるときだけ出す**
+ * （`price` は指値だけ、`canceled_at` は取消済みだけ、`executed_at` は約定があるときだけ。
+ * `docs/fidelity.md` の「private stream の注文ペイロード」）。その 3 つと `post_only` は
+ * 下の `OFFICIAL_STREAM_ORDER_CONDITIONAL_FIELDS` に置き、出る条件は `streamOrderShape()` が持つ。
+ */
+export const OFFICIAL_STREAM_ORDER_FIELDS: Record<string, FieldCheck> = {
+  average_price: isString,
+  executed_amount: isString,
+  order_id: isNumber,
+  ordered_at: isNumber,
+  pair: isString,
+  remaining_amount: isStringOrNull,
+  side: isString,
+  start_amount: isStringOrNull,
+  status: isString,
+  type: isString,
+  expire_at: isNumberOrNull,
+  user_cancelable: isBoolean,
+  is_just_triggered: isBoolean,
+};
+
+/** 上の表のうち、本モックが条件付きで出す行（条件は `streamOrderShape()`）。 */
+export const OFFICIAL_STREAM_ORDER_CONDITIONAL_FIELDS: Record<string, FieldCheck> = {
+  canceled_at: isNumber,
+  executed_at: isNumber,
+  price: isString,
+  post_only: isBoolean,
+};
+
+/** 上の表の status enum（`private-stream.md:130`）。`REJECTED` を含まない 6 値。 */
+export const OFFICIAL_STREAM_ORDER_STATUSES = [
+  "INACTIVE",
+  "UNFILLED",
+  "PARTIALLY_FILLED",
+  "FULLY_FILLED",
+  "CANCELED_UNFILLED",
+  "CANCELED_PARTIALLY_FILLED",
+];
+
+/**
+ * `method: spot_trade` のフィールド表（`private-stream.md:245-261`）。`position_side` /
+ * `profit_loss` / `interest`（いずれも `| undefined`、信用取引の項目）を除く全行。
+ *
+ * ```
+ * amount | string | executed amount
+ * executed_at | number | order executed at unix timestamp (milliseconds)
+ * fee_amount_base | string | base asset fee amount
+ * fee_amount_quote | string | quote asset fee amount
+ * fee_occurred_amount_quote | string | Quote fee occurred. ...
+ * maker_taker | string | maker or taker
+ * order_id | number | order ID
+ * pair | string | pair enum: [pair list](pairs.md)
+ * price | string | order price
+ * side | string | `buy` or `sell`
+ * trade_id | number | trade ID
+ * type | string | one of `limit`, `market`, ...
+ * ```
+ */
+export const OFFICIAL_SPOT_TRADE_FIELDS: Record<string, FieldCheck> = {
+  amount: isString,
+  executed_at: isNumber,
+  fee_amount_base: isString,
+  fee_amount_quote: isString,
+  fee_occurred_amount_quote: isString,
+  maker_taker: isString,
+  order_id: isNumber,
+  pair: isString,
+  price: isString,
+  side: isString,
+  trade_id: isNumber,
+  type: isString,
+};
+
+/**
+ * `method: asset_update` の**フィールド表**（`private-stream.md:80-87`）。snake_case。
+ *
+ * ```
+ * asset | string  | Asset name: [Asset list](assets.md)
+ * amount_precision | number | Precision
+ * free_amount | string | Available amount
+ * locked_amount | string | Locked amount
+ * onhand_amount | string | On-hand amount
+ * withdrawing_amount | string | Withdrawing amount
+ * ```
+ *
+ * **同じ節の JSON 応答例は camelCase で、表と食い違う**（下の定数。`docs/fidelity.md` の
+ * 「private stream の `asset_update` のキー」）。どちらかを正に選ばず、両方を写す。
+ */
+export const OFFICIAL_ASSET_UPDATE_SNAKE_FIELDS: Record<string, FieldCheck> = {
+  asset: isString,
+  amount_precision: isNumber,
+  free_amount: isString,
+  locked_amount: isString,
+  onhand_amount: isString,
+  withdrawing_amount: isString,
+};
+
+/**
+ * `method: asset_update` の**JSON 応答例**（`private-stream.md:89-107`）。camelCase。
+ *
+ * ```json
+ * "asset": "string",
+ * "amountPrecision": 0,
+ * "freeAmount": "string",
+ * "lockedAmount": "string",
+ * "onhandAmount": "string",
+ * "withdrawingAmount": "string"
+ * ```
+ */
+export const OFFICIAL_ASSET_UPDATE_CAMEL_FIELDS: Record<string, FieldCheck> = {
+  asset: isString,
+  amountPrecision: isNumber,
+  freeAmount: isString,
+  lockedAmount: isString,
+  onhandAmount: isString,
+  withdrawingAmount: isString,
+};
+
+/**
+ * stream の注文オブジェクトの期待形。REST の `orderShape()` と同じく、`type` と「取消済みか」
+ * 「約定があるか」から出るはずのキー集合を組み立てる。
+ */
+export function streamOrderShape(
+  actual: Record<string, unknown>,
+  expected: { type: "limit" | "market"; canceled: boolean; executed: boolean },
+): { actual: OrderShapeResult; expected: OrderShapeResult } {
+  const keys = Object.keys(OFFICIAL_STREAM_ORDER_FIELDS);
+  if (expected.type === "limit") keys.push("price", "post_only");
+  if (expected.canceled) keys.push("canceled_at");
+  if (expected.executed) keys.push("executed_at");
+  return {
+    actual: {
+      type: actual.type,
+      ...shapeOf(actual, {
+        ...OFFICIAL_STREAM_ORDER_FIELDS,
+        ...OFFICIAL_STREAM_ORDER_CONDITIONAL_FIELDS,
+      }),
+    },
+    expected: { type: expected.type, keys: keys.sort(), badTypes: [] },
+  };
+}
+
+/** 条件付きのフィールドを持たない表どうしの比較（`spot_trade` / `asset_update` / subscribe）。 */
+export function flatShape(
+  actual: Record<string, unknown>,
+  spec: Record<string, FieldCheck>,
+): { actual: ShapeResult; expected: ShapeResult } {
+  return {
+    actual: shapeOf(actual, spec),
+    expected: { keys: Object.keys(spec).sort(), badTypes: [] },
+  };
+}

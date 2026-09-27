@@ -15,7 +15,7 @@ import {
 import { buildServer } from "../../src/server/http.ts";
 import { SessionStore } from "../../src/store/session.ts";
 import { buildOrder, buildState, buildTrade, candle } from "../engine/helpers.ts";
-import { stubFetchCandles } from "../routes/helpers.ts";
+import { connectStream, stubFetchCandles } from "../routes/helpers.ts";
 
 const NOW = Date.now();
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -190,6 +190,14 @@ describe("劣化モード（persist に失敗した後）", () => {
       const assets = await fastify.inject({ method: "GET", url: "/v1/user/assets" });
       expect(assets.statusCode).toBe(200);
       expect(assets.json().success).toBe(1);
+
+      // private stream の 2 経路も読み取り。接続は断らない（状態が動かないので何も流れない）。
+      const subscribe = await fastify.inject({ method: "GET", url: "/v1/user/subscribe" });
+      expect(subscribe.statusCode).toBe(200);
+      expect(subscribe.json().success).toBe(1);
+      const stream = await connectStream(fastify);
+      expect(fastify.privateStream.clientCount()).toBe(1);
+      stream.ws.terminate();
 
       // シナリオの読み出し口。ここから状態ファイルへ書き戻して再起動するのが復帰手順。
       const state = await fastify.inject({ method: "GET", url: "/_control/state" });

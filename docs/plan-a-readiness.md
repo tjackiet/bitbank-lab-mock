@@ -46,7 +46,10 @@
   [`fidelity.md` の「拘束額」](fidelity.md#拘束額)
 - **`/_control/`** — bitbank API に無い実験用の口なので、比べる相手がいない。
   [`fidelity.md` の「`/_control/`」](fidelity.md#_control)
-- **非目標に挙げたもの**（認証・レート制限・注文訂正・private stream など） — [`README.md`](../README.md) の
+- **private stream** — 実装しているが、配信は PubNub でなく素の WebSocket で、**いつ届くかもモック固有**である。
+  メッセージの中身は公式の形に寄せてあるが、公式が食い違っている箇所（`asset_update` のキー）と書いていない箇所
+  （`executed_at`）は推測で決めた。[`fidelity.md` の「private stream」](fidelity.md#private-stream)から始まる一連の節
+- **非目標に挙げたもの**（認証・レート制限・注文訂正・障害注入など） — [`README.md`](../README.md) の
   「非目標（Plan A）」と 5 節
 
 **これはこのモックについての自己申告である。** 何をどこまで検証したかは上の各節が持つので、
@@ -54,7 +57,7 @@
 
 ## 2. このモックで何ができるか
 
-実験環境として一般に求められる 8 項目について、対応の有無と、根拠を読む場所。
+実験環境として一般に求められる項目について、対応の有無と、根拠を読む場所。
 **表に挙動は書かない**——「どう動くか」は右列の節で読む。
 
 | 項目 | 対応 | 経路 | 根拠を読む節（[`fidelity.md`](fidelity.md)） |
@@ -67,8 +70,9 @@
 | 時計の操作 | **一部** | `POST /_control/clock` / `POST /_control/tick` | [control の時計](fidelity.md#control-の時計) |
 | 再起動をまたぐ永続化 | **一部** | 状態ファイル（`BITBANK_MOCK_STATE_PATH`） | [状態の永続化](fidelity.md#状態の永続化) / [壊れた状態ファイル](fidelity.md#壊れた状態ファイル) / [同一状態ファイルの多重起動](fidelity.md#同一状態ファイルの多重起動) |
 | 失敗の見え方（error code と封筒） | **一部** | 互換ルートは封筒、`/_control/` は素の JSON | [エラーコード](fidelity.md#エラーコード) / [封筒に包まれない応答](fidelity.md#封筒に包まれない応答) / [配列の包み方](fidelity.md#配列の包み方) |
+| 注文・約定・残高の変化の push 受信 | **一部** | `GET /_stream/private`（WebSocket）と `GET /v1/user/subscribe` | [private stream](fidelity.md#private-stream) / [private stream のメッセージ](fidelity.md#private-stream-のメッセージ) / [private stream の発火契機](fidelity.md#private-stream-の発火契機) |
 
-「**一部**」と書いた 3 つは、対応してはいるが**範囲に条件が付く**もの。条件そのものは上の節で読む。
+「**一部**」と書いたものは、対応してはいるが**範囲に条件が付く**もの。条件そのものは上の節で読む。
 
 - **時計の操作** — 動かせる範囲に上限がある。上限の値と、超えたときに返るもの、戻す手段は
   [`fidelity.md` の「control の時計」](fidelity.md#control-の時計)にある
@@ -76,6 +80,10 @@
   書き込みが効いているかの確かめ方は [`fidelity.md` の「状態の永続化」](fidelity.md#状態の永続化)にある
 - **失敗の見え方** — 実装済みのエンドポイントでも、**封筒に包まれない応答が返る経路がある**。
   どの経路がそうなるかは [`fidelity.md` の「封筒に包まれない応答」](fidelity.md#封筒に包まれない応答)にある
+- **push 受信** — **PubNub ではなく素の WebSocket** で配信する。market モードでは誰かが互換ルートを叩いたときにだけ
+  約定とイベントが起き、`POST /_control/reset` は接続を閉じる。順序の入れ替わりや重複を起こす手段は無い。
+  条件は [`fidelity.md` の「private stream の発火契機」](fidelity.md#private-stream-の発火契機)と
+  [`fidelity.md` の「private stream と状態の初期化」](fidelity.md#private-stream-と状態の初期化)にある
 
 ### 実装しているエンドポイント
 
@@ -144,6 +152,10 @@
 - [資産応答の固定フィールド](fidelity.md#資産応答の固定フィールド) / [信用取引・逆指値の項目](fidelity.md#信用取引逆指値の項目) —
   値が固定のフィールドと、キー自体を出さないフィールドがある。**固定値を実際の値と解釈せず、未実装の印として扱う**
 - [約定の固定フィールド](fidelity.md#約定の固定フィールド) — 一部のフィールドの文字列表記に桁を仮定しないこと
+- [private stream の `asset_update` のキー](fidelity.md#private-stream-の-asset_update-のキー) — **公式の表と例でキーの綴りが食い違い、
+  既定の camelCase は推測である。** 両方の綴りを受けるパーサにし、`BITBANK_MOCK_STREAM_ASSET_KEYS` で切り替えて確かめること
+- [private stream の注文ペイロード](fidelity.md#private-stream-の注文ペイロード) — `executed_at` を出す条件と値の選び方が推測。
+  **成行の `spot_order_new` は `FULLY_FILLED` で届く**ので、新規の通知が `UNFILLED` で始まることを前提にしないこと
 
 ### 照合（Reconcile）の前提（基準 b）
 
@@ -186,7 +198,8 @@
   [`README.md`](../README.md) の「免責事項」にある
 - 個別の未実装項目の理由は、対応表の
   [認証](fidelity.md#認証) / [レート制限](fidelity.md#レート制限) / [注文訂正](fidelity.md#注文訂正) /
-  [成行注文の価格上限](fidelity.md#成行注文の価格上限) / [private stream](fidelity.md#private-stream) の各節にある
+  [成行注文の価格上限](fidelity.md#成行注文の価格上限) / [private stream の順序](fidelity.md#private-stream-の順序)（障害注入） /
+  [private stream の `spot_order_invalidation`](fidelity.md#private-stream-の-spot_order_invalidation) の各節にある
 
 ## 6. 最初に流すシナリオ
 

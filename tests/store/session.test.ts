@@ -883,3 +883,120 @@ describe("SessionStore の足の取得の健全性", () => {
     }
   });
 });
+
+describe("SessionStore の状態の差し替えの通知", () => {
+  const manualStore = (state: PaperState = buildState()) =>
+    new SessionStore(state, { path: null, fillMode: "manual", fetchCandles: stubFetchCandles({}) });
+
+  it("replace は差し替えの直前と直後を update として渡し、外した購読者には渡さない", () => {
+    const store = manualStore();
+    const seen: Array<{ prevOrders: number; nextOrders: number; kind: string }> = [];
+    const off = store.onStateChange(({ prev, next, kind }) => {
+      seen.push({ prevOrders: prev.orders.length, nextOrders: next.orders.length, kind });
+    });
+    store.replace(buildState({ orders: [buildOrder()] }));
+    off();
+    store.replace(buildState());
+    expect(seen).toEqual([{ prevOrders: 0, nextOrders: 1, kind: "update" }]);
+  });
+
+  it("同じ状態を渡し直しただけなら通知しない", () => {
+    const state = buildState();
+    const store = manualStore(state);
+    const listener = vi.fn();
+    store.onStateChange(listener);
+    store.replace(state);
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("commit は書き出しを待たず、メモリへ反映した直後に通知する", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "bitbank-mock-notify-"));
+    try {
+      const store = new SessionStore(buildState(), {
+        path: join(dir, "state.json"),
+        fillMode: "manual",
+        fetchCandles: stubFetchCandles({}),
+      });
+      const listener = vi.fn();
+      store.onStateChange(listener);
+      const pending = store.commit(buildState({ orders: [buildOrder()] }));
+      // まだ書き出しは終わっていないが、通知は済んでいる（stream が HTTP 応答より先に届き得る理由）。
+      expect(listener).toHaveBeenCalledTimes(1);
+      await pending;
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reset は kind を reset にして渡す", async () => {
+    const store = manualStore(buildState({ orders: [buildOrder()] }));
+    const kinds: string[] = [];
+    store.onStateChange(({ kind }) => kinds.push(kind));
+    await store.reset(buildState());
+    expect(kinds).toEqual(["reset"]);
+    expect(store.state().orders).toEqual([]);
+  });
+
+  it("market の tick が埋めた約定も通知に載る（commit を通らない経路）", async () => {
+    const state = buildState({
+      balances: { jpy: 10_000_000 },
+      lastTickAt: new Date(T0).toISOString(),
+      orders: [buildOrder({ id: "1", side: "buy", price: 100, startAmount: 1 })],
+    });
+    const store = new SessionStore(state, {
+      path: null,
+      fillMode: "market",
+      fetchCandles: stubFetchCandles({ btc_jpy: [candle(T0 + MIN, 110, 110, 50, 105)] }),
+      feeRate: 0,
+    });
+    const changes: Array<{ trades: number; lastTickAt: string }> = [];
+    store.onStateChange(({ next }) =>
+      changes.push({ trades: next.trades.length, lastTickAt: next.lastTickAt }),
+    );
+    await store.tick(T0 + 2 * MIN);
+    // 約定 1 回と、時計の前進 1 回。どちらも同じ口を通る。
+    expect(changes.map((c) => c.trades)).toEqual([1, 1]);
+    expect(changes.at(-1)?.lastTickAt).toBe(new Date(T0 + 2 * MIN).toISOString());
+  });
+
+  it("購読者が投げても差し替えは止まらず、後ろの購読者にも届く", () => {
+    const warnings: string[] = [];
+    const store = new SessionStore(buildState(), {
+      path: null,
+      fillMode: "manual",
+      fetchCandles: stubFetchCandles({}),
+      logger: { warn: (m) => warnings.push(m), info: () => {} },
+    });
+    const after = vi.fn();
+    store.onStateChange(() => {
+      throw new Error("boom\nsecond line");
+    });
+    store.onStateChange(after);
+    const next = buildState({ orders: [buildOrder()] });
+    store.replace(next);
+    expect(store.state()).toBe(next);
+    expect(after).toHaveBeenCalledTimes(1);
+    // 理由は JSON で包んで 1 行に収める。
+    expect(warnings).toEqual(['state listener failed: "boom\\nsecond line"']);
+  });
+
+  it("購読者が投げ、さらに warn まで投げても差し替えは止まらない", () => {
+    const store = new SessionStore(buildState(), {
+      path: null,
+      fillMode: "manual",
+      fetchCandles: stubFetchCandles({}),
+      logger: {
+        warn: () => {
+          throw new Error("EPIPE");
+        },
+        info: () => {},
+      },
+    });
+    store.onStateChange(() => {
+      throw "not an Error";
+    });
+    const next = buildState({ orders: [buildOrder()] });
+    expect(() => store.replace(next)).not.toThrow();
+    expect(store.state()).toBe(next);
+  });
+});
