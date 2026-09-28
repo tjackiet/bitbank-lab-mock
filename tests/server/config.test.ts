@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { fillMode, isControlEnabled, listenHost } from "../../src/server/config.ts";
+import {
+  fillMode,
+  isControlEnabled,
+  listenHost,
+  streamAssetKeys,
+} from "../../src/server/config.ts";
 
 describe("server config", () => {
   it("enables control only when BITBANK_MOCK_CONTROL=1", () => {
@@ -21,5 +26,14 @@ describe("server config", () => {
     expect(listenHost({})).toBe("0.0.0.0");
     expect(listenHost({ BITBANK_MOCK_CONTROL: "1" })).toBe("127.0.0.1");
     expect(listenHost({ BITBANK_MOCK_CONTROL: "1", BITBANK_MOCK_HOST: "0.0.0.0" })).toBe("0.0.0.0");
+  });
+
+  it("asset_update のキーは既定 camel で、snake のときだけ snake", () => {
+    expect(streamAssetKeys({})).toBe("camel");
+    expect(streamAssetKeys({ BITBANK_MOCK_STREAM_ASSET_KEYS: "snake" })).toBe("snake");
+    expect(streamAssetKeys({ BITBANK_MOCK_STREAM_ASSET_KEYS: "camel" })).toBe("camel");
+    // 空文字と未知の値は既定に落とす（他の env と同じ規則）。
+    expect(streamAssetKeys({ BITBANK_MOCK_STREAM_ASSET_KEYS: "" })).toBe("camel");
+    expect(streamAssetKeys({ BITBANK_MOCK_STREAM_ASSET_KEYS: "SNAKE" })).toBe("camel");
   });
 });

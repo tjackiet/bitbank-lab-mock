@@ -15,6 +15,11 @@ export type PersistFailureMode = "degrade" | "ignore";
  * 判定すると、注文状態の照合の主経路（`docs/plan-lab-mock.md` の R1）を劣化中に殺す。
  *
  * `HEAD` は Fastify が `GET` から自動登録するので、判定では `GET` と同じに扱う。
+ *
+ * **private stream の 2 経路も読み取りに入れる。** `GET /v1/user/subscribe` は固定の値を
+ * 返すだけで、`GET /_stream/private` は状態を読み出して送るだけである。劣化中は状態が
+ * 動かないので stream には何も流れないが、接続そのものは断らない（読み取りを生かす、という
+ * 劣化モードの約束に揃える）。
  */
 export const READ_ROUTES: ReadonlySet<string> = new Set([
   "GET /v1/user/spot/order",
@@ -22,6 +27,8 @@ export const READ_ROUTES: ReadonlySet<string> = new Set([
   "GET /v1/user/assets",
   "GET /v1/user/spot/active_orders",
   "GET /v1/user/spot/trade_history",
+  "GET /v1/user/subscribe",
+  "GET /_stream/private",
   "GET /_control/state",
 ]);
 

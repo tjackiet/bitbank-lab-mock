@@ -176,7 +176,9 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
       }
       next = { ...next, balances };
     }
-    await fastify.store.commit(next);
+    // commit() ではなく reset() を通す。購読者（private stream）に「差分ではなく丸ごとの
+    // 差し替え」だと伝えるため（`docs/fidelity.md` の「private stream と状態の初期化」）。
+    await fastify.store.reset(next);
     return next;
   });
 

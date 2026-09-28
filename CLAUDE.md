@@ -41,6 +41,7 @@
 - **互換ルート（`/v1/user/...`）は `src/routes/envelope.ts` の `ok()` / `err()` で封筒に包む。** 成功は `{ success: 1, data }`、失敗は `{ success: 0, data: { code } }`。code は同ファイルの `ErrorCode` から選ぶ（残高不足 `60001`、注文が見つからない `50009`）。登録は `src/server/http.ts` の `buildServer()`。
 - **`/_control/` は bitbank API に無い実験用の口で、封筒に包まず素の JSON。** 失敗は HTTP ステータス（400 / 403 / 404 / 409、劣化後は 503）。`BITBANK_MOCK_CONTROL=1` のときだけ登録し、非ループバックには `X-Control-Token` を要求する。実装は `src/routes/control.ts`。
 - **注文の単一の真実は `src/engine/state.ts` の `OrderRecord`。** 状態全体は `PaperState`（zod、`version: 3`）。
+- **`SessionStore` の `_state` は `setState()` 以外から書き換えない。** private stream（`src/stream/`）は `SessionStore.onStateChange()` が渡す差し替えの前後の差からイベントを作るので、この口を通れば新しい経路にも通知が自動で付き、迂回すると stream に黙って流れない。WebSocket の口は `GET /_stream/private`（bitbank API には無い。公式は PubNub）で、挙動の正は `docs/fidelity.md` の「private stream」から始まる一連の節。
 - **遷移関数を通る限り `src/engine/invariants.ts` の不変量は破れない**（一覧は `docs/fidelity.md` の「6 本の不変量」。移行してきた状態など例外も同ファイル）。**状態を変える変更を入れたら `tests/engine/invariants.test.ts` も確認する**（fast-check のプロパティテスト）。
 - **コメントとドキュメントは日本語**で書く。
 

@@ -104,6 +104,31 @@ function isNotOlderThan(ms: number, recorded: string | null): boolean {
   return recorded === null || ms >= Date.parse(recorded);
 }
 
+/**
+ * 状態の差し替え 1 回ぶん。`SessionStore.onStateChange()` の購読者へ渡す。
+ *
+ * **`prev` と `next` は差し替えの直前と直後の状態そのもの**で、途中を畳んでいない。
+ * 状態を変える経路はどれも `SessionStore` の中の 1 か所（`setState()`）を通るので、
+ * 購読者は経路ごとの戻り値を知らなくても「何が変わったか」を 2 つの状態の差から読める。
+ * private stream（`src/stream/`）はこれを使う（`docs/plan-lab-mock.md` 16 節）。
+ *
+ * - `update`: 遷移関数を通った変化（`commit()` と `tick()`）と、テストが使う `replace()`
+ * - `reset`: 状態を丸ごと差し替えた（`POST /_control/reset`）。注文も約定も採番も捨てて
+ *   やり直すので、**差分として読んではいけない**——注文 id が 1 から配り直され、
+ *   消えた注文を表す手段も公式のメッセージに無い
+ */
+export type StateChange = {
+  prev: PaperState;
+  next: PaperState;
+  kind: "update" | "reset";
+};
+
+/**
+ * 状態の差し替えを受け取る関数。**同期に呼ばれ、戻るまで次の差し替えは起きない。**
+ * 投げても状態の差し替えは取り消されない（`setState()` が握り潰して warn に落とす）。
+ */
+export type StateListener = (change: StateChange) => void;
+
 export type SessionStoreOptions = {
   fetchCandles?: FetchCandles;
   path?: string | null;
@@ -129,6 +154,8 @@ export class SessionStore {
   private _persistHealth: PersistHealth = { lastError: null, consecutiveFailures: 0 };
   /** 足の取得の成否の記録。`candlesHealth()` で読む。`fillMode` が決まってから組み立てる。 */
   private _candlesHealth: CandlesHealth;
+  /** 状態の差し替えの購読者。`onStateChange()` で足し、戻り値の関数で外す。 */
+  private readonly stateListeners = new Set<StateListener>();
 
   constructor(state: PaperState, opts: SessionStoreOptions = {}) {
     this._state = state;
@@ -150,8 +177,57 @@ export class SessionStore {
     return this._state;
   }
 
+  /**
+   * 状態を差し替える（書き出しはしない）。購読者（`onStateChange()`）には通知する。
+   */
   replace(next: PaperState): void {
+    this.setState(next, "update");
+  }
+
+  /**
+   * 状態の差し替えを購読する。戻り値の関数を呼ぶと外れる。
+   *
+   * **状態を変える経路はすべてここへ通知される**——`commit()`（互換ルートと `/_control/` の
+   * fill / tick / clock）、`reset()`（`POST /_control/reset`）、`tick()`（market モードの
+   * 約定と時計の前進）。経路ごとに通知を足す形にしないのは `commit()` と同じ理屈で、
+   * 新しい経路が通知を書き忘れても**黙って抜ける**ことが無いようにするためである
+   * （`docs/plan-lab-mock.md` 14.1 の (3) が、経路ごとの戻り値では一括取消と `tick()` の
+   * 個々の変化を復元できないことを記録している）。
+   *
+   * 通知は**メモリへ反映した直後**に同期で行う。書き出し（`persist()`）の成否を待たない
+   * （`docs/plan-lab-mock.md` 16 節の決定 14）。
+   */
+  onStateChange(listener: StateListener): () => void {
+    this.stateListeners.add(listener);
+    return () => {
+      this.stateListeners.delete(listener);
+    };
+  }
+
+  /**
+   * `_state` を書き換える唯一の口。書き換えてから購読者へ通知する。
+   *
+   * **購読者の例外で状態の差し替えを止めない。** 差し替えは既に済んでおり、ここで投げると
+   * `commit()` が `persist()` へ進まずにルートが封筒でない 500 を返す——発注はメモリ上で
+   * 成立しているのに失敗が返り、再送が二重注文になる（`write()` が EPIPE を握り潰すのと
+   * 同じ理由）。warn に落とし、warn 自体が投げても握り潰す。
+   */
+  private setState(next: PaperState, kind: StateChange["kind"]): void {
+    const prev = this._state;
     this._state = next;
+    if (prev === next) return;
+    for (const listener of this.stateListeners) {
+      try {
+        listener({ prev, next, kind });
+      } catch (e) {
+        try {
+          const message = e instanceof Error ? e.message : String(e);
+          this.logger.warn(`state listener failed: ${JSON.stringify(message)}`);
+        } catch {
+          // ログに出せなくても状態は既に差し替わっている。ここで投げる先は無い。
+        }
+      }
+    }
   }
 
   /**
@@ -171,6 +247,19 @@ export class SessionStore {
    */
   async commit(next: PaperState): Promise<void> {
     this.replace(next);
+    await this.persist();
+  }
+
+  /**
+   * 状態を丸ごと差し替えて書き出す（`POST /_control/reset`）。書き出しの扱いは `commit()` と同じ。
+   *
+   * `commit()` と分けてあるのは購読者に `kind: "reset"` を渡すため**だけ**である。reset の後は
+   * 注文 id が 1 から配り直されるので、差分として読むと「前の注文 1」と「新しい注文 1」が
+   * 同じ注文に見える。private stream はこれを受けて接続を切る（`docs/fidelity.md` の
+   * 「private stream と状態の初期化」）。
+   */
+  async reset(next: PaperState): Promise<void> {
+    this.setState(next, "reset");
     await this.persist();
   }
 
@@ -329,10 +418,10 @@ export class SessionStore {
         continue;
       }
       totalFilled += sr.data.filled.length;
-      this._state = sr.data.state;
+      this.setState(sr.data.state, "update");
     }
     const ts = new Date(nowMs).toISOString();
-    this._state = { ...this._state, lastTickAt: ts, updatedAt: ts };
+    this.setState({ ...this._state, lastTickAt: ts, updatedAt: ts }, "update");
     // 約定が無いときは書かない（互換ルートは読み取りでも tick を回すので、毎回書くと
     // 状態ファイルへの書き込みが要求ごとに起きる）。ただし時計が先にあった回だけは、
     // ここで実時刻へ戻した lastTickAt を残す。残さないと、再起動後にファイルから

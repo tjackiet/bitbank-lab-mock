@@ -41,6 +41,7 @@ const REQUESTS: Record<string, { query?: string; payload?: InjectOptions["payloa
   "POST /v1/user/spot/orders_info": { payload: { pair: "btc_jpy", order_ids: [1] } },
   "POST /v1/user/spot/cancel_order": { payload: { pair: "btc_jpy", order_id: 1 } },
   "POST /v1/user/spot/cancel_orders": { payload: { pair: "btc_jpy", order_ids: [1] } },
+  "GET /v1/user/subscribe": {},
 };
 
 /**
@@ -60,6 +61,20 @@ const READS_STATE_BEFORE_TICK: Record<string, string> = {
   "POST /v1/user/spot/order":
     "同時未約定注文の上限（`60011`）を `activeOrders(store.state()).length` で見る。" +
     "断るときに状態を一切変えないため、判定は `tick()` より前に置いてある",
+};
+
+/**
+ * **`tick()` を呼ばない互換ルートと、その理由。** ここに載せたルートには下で
+ * 「`tick()` も `state()` も 1 度も呼ばない」を要求するので、後から状態を読むようにしたら
+ * エントリを外すまで落ちる（読むなら tick も要る、という既定に戻る）。
+ *
+ * 上の `READS_STATE_BEFORE_TICK` と同じく、**例外を 1 か所に集めて古くならせないため**に持つ。
+ */
+const NO_STATE_ROUTES: Record<string, string> = {
+  "GET /v1/user/subscribe":
+    "固定のチャンネル名とトークンを返すだけで状態を読まない。tick すると、再接続の手順" +
+    "（subscribe → 接続）のまだ繋がっていない窓で約定のイベントが流れて取りこぼされる" +
+    "（`src/routes/subscribe.ts`）",
 };
 
 /** 直前に置いた指値と、それを満たす足。`tick()` が走れば注文 1 が全量約定する。 */
@@ -84,7 +99,7 @@ describe("互換ルートは tick を通る", () => {
     // 片方にだけ足すと落ちる。落ちたら REQUESTS を直す（一覧の側は手で触らない）。
     expect(Object.keys(REQUESTS).sort()).toEqual(COMPAT_ROUTE_KEYS);
     // 許可リストが実在しないルートを指していないこと（ルート名を変えたら落ちる）。
-    for (const key of Object.keys(READS_STATE_BEFORE_TICK)) {
+    for (const key of [...Object.keys(READS_STATE_BEFORE_TICK), ...Object.keys(NO_STATE_ROUTES)]) {
       expect(COMPAT_ROUTE_KEYS).toContain(key);
     }
   });
@@ -124,6 +139,12 @@ describe("互換ルートは tick を通る", () => {
 
     // 検証で弾かれていないこと。弾かれていると tick より手前で返るので、何も測れない。
     expect(res.statusCode).toBe(200);
+    if (NO_STATE_ROUTES[key] !== undefined) {
+      // 状態を読まないので tick も要らない。読み始めたらここで落ちる。
+      expect(calls, NO_STATE_ROUTES[key]).toEqual([]);
+      expect(realState().orders[0].status).toBe("UNFILLED");
+      return;
+    }
     const firstTick = calls.indexOf("tick");
     expect(firstTick, `${key} が tick() を呼んでいない`).toBeGreaterThanOrEqual(0);
     const reason = READS_STATE_BEFORE_TICK[key];

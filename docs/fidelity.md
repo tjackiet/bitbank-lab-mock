@@ -6,7 +6,7 @@
 版として凍結してあるのは `v0.1.0`（タグは `3f823fb` = PR #11、2026-09-11）だけで、**その後も挙動を変える改訂が入り続けている**。
 v0.1.0 から何が変わったかは下の「[v0.1.0 からの改訂](#v010-からの改訂)」に索引があり、内容はそれぞれの項目の小節で読む。
 実 API がどう振る舞うかを確かめたい問いは「[実 API への問い](#実-api-への問い)」に索引がある。
-API 担当レビュー後に「確認済み／要修正」列を足す。private stream（R4）は Phase 5 の予定のまま。
+API 担当レビュー後に「確認済み／要修正」列を足す。private stream（R4）は 2026-09-27 に素の WebSocket で実装した（「[private stream](#private-stream)」節から読む）。
 
 ## 出典
 
@@ -14,6 +14,7 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [bitbank error codes](https://github.com/bitbankinc/bitbank-api-docs/blob/0badd68019646171826625b074cfef4235c3e713/errors.md)（2026-09-11 確認）
 - [bitbank pair list](https://github.com/bitbankinc/bitbank-api-docs/blob/0badd68019646171826625b074cfef4235c3e713/pairs.md)（2026-09-11 確認）
 - [bitbank private stream](https://github.com/bitbankinc/bitbank-api-docs/blob/0badd68019646171826625b074cfef4235c3e713/private-stream.md)（2026-09-21 確認）
+- [bitbank private stream（日本語版）](https://github.com/bitbankinc/bitbank-api-docs/blob/0badd68019646171826625b074cfef4235c3e713/private-stream_JP.md)（2026-09-27 確認）
 - [bitbank Public REST API](https://github.com/bitbankinc/bitbank-api-docs/blob/0badd68019646171826625b074cfef4235c3e713/public-api.md)（2026-09-21 確認）
 - [bitbank Public REST API（日本語版）](https://github.com/bitbankinc/bitbank-api-docs/blob/0badd68019646171826625b074cfef4235c3e713/public-api_JP.md)（2026-09-21 確認）
 
@@ -49,6 +50,7 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [注文 ID](#注文-id) — 採番が安全整数を使い切ったら発注・約定を断る（互換ルートでは `70001`）
 - [一括取消の件数上限](#一括取消の件数上限) — `cancel_orders` の `order_ids` が 30 件を超えたら `40015` で断る（改訂前: 上限が無く、31 件でも全部取り消していた）
 - [同時未約定注文の上限](#同時未約定注文の上限) — active な注文が既に 30 本あるとき**新規発注**を `60011` で断る（改訂前: 上限が無く、31 本目も通っていた）
+- [private stream](#private-stream) — `GET /v1/user/subscribe` を実装した（ダミーのチャンネル名とトークンを封筒で返す。改訂前: 未登録パスとして HTTP 200 + 封筒 `20003`）
 
 ### `/_control/`
 
@@ -58,6 +60,11 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [control のアクセス境界](#control-のアクセス境界) — 許可判定を TCP の対向アドレスに固定し、`X-Control-Token` はヘッダ行がちょうど 1 本のときだけ受け、一致を `timingSafeEqual` で見る
 - [`/_control/`](#_control) — `GET /_control/state` に状態ファイルへの書き出しの状況（`persist`）を添える
 - [足の取得の健全性](#足の取得の健全性) — `GET /_control/state` に足の取得の状況（`candles`）を添える（取得に失敗しても互換ルートは成功応答のまま。改訂前: 失敗は warn に出るだけで、応答からは見えなかった）
+
+### private stream（`/_stream/private`）
+
+- [private stream](#private-stream) — WebSocket の口 `GET /_stream/private` を足し、状態の変化を公式と同じ形のメッセージで配信する（改訂前: 口が無く、未登録パスとして HTTP 404 + 封筒 `10000`）
+- [private stream と状態の初期化](#private-stream-と状態の初期化) — `POST /_control/reset` が private stream の接続をすべて close code `1012` で閉じる（HTTP の応答は変えていない）
 
 ### 永続化と起動
 
@@ -158,7 +165,11 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [パラメータの型強制](#パラメータの型強制) — `cancel_order` の `order_id` が id として読めないとき、実 API は `40013` を返しますか
 - [パラメータの型強制](#パラメータの型強制) — `cancel_orders` の `order_ids` が id の非空配列でないとき、実 API は `40014` を返しますか
 - [同じ名前で複数来る値](#同じ名前で複数来る値) — 数値を取るクエリパラメータ（`count` など）を同名で 2 本送ったとき、実 API は断りますか、どちらかの値を採りますか
-- [private stream の順序](#private-stream-の順序) — 実 API の private stream は、メッセージを発生順に重複なく届けることを保証しますか
+- [private stream のメッセージ](#private-stream-のメッセージ) — 実 API は、1 つのメッセージの `params` に複数の要素を入れて送ることがありますか
+- [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 約定していない注文の `spot_order_new` / `spot_order` で、実 API は `executed_at` に何を返しますか
+- [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 実 API の注文ペイロードの `executed_at` は、最初の約定時刻と最後の約定時刻のどちらですか
+- [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 実 API の `spot_order_new` / `spot_order` は、取り消していない注文や成行注文でも `canceled_at` / `price` のキーを含めますか
+- [private stream の順序](#private-stream-の順序) — 実 API の private stream は、同じメッセージを重複して届けることがありますか
 - [private stream の `asset_update` のキー](#private-stream-の-asset_update-のキー) — 実 API の `asset_update` は、キーを snake_case（`free_amount`）と camelCase（`freeAmount`）のどちらで送りますか
 - [private stream の `spot_order_invalidation`](#private-stream-の-spot_order_invalidation) — 実 API の `spot_order_invalidation` の `params` は、オブジェクトと配列のどちらですか
 - [private stream の `spot_order_invalidation`](#private-stream-の-spot_order_invalidation) — 実 API の `spot_order_invalidation` の `order_id` は、単数の数値と配列のどちらですか
@@ -171,13 +182,14 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [公開 Candlestick の消費](#公開-candlestick-の消費) — 公開 API の `candlestick/1min/{YYYYMMDD}` の日付は、JST（UTC+9）の日付境界で切られますか
 - [公開 Candlestick の消費](#公開-candlestick-の消費) — 公開 API の `candlestick` 配列は、1 つの要求に対して複数の要素を返すことがありますか
 - [公開 Candlestick の消費](#公開-candlestick-の消費) — 公開 API の `candlestick` は、足が 1 本も無いとき空配列を返しますか
+- [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 実 API で成行注文を出したとき、`spot_order_new` は `status` が `FULLY_FILLED` の 1 通だけで届きますか
 - [private stream の `spot_order_invalidation`](#private-stream-の-spot_order_invalidation) — 実 API で `spot_order_invalidation` が送られる「資産不足」は、利用者のどの操作で起こり得ますか
 
 ## 対応表
 
 項目ごとに 1 小節。**「モックの挙動」が本文、残りの 4 列が箇条書き**である。v0.1.0 までは 1 項目 1 行の表だったが、1 行が 5,000 文字を超えて `grep` でも部分読みでも扱えなくなったため、内容を変えずに小節へ移した。
 
-**根拠の読み方**: 公式を根拠に引くときは、**フィールド表・JSON 応答例・本文の注記を全部突き合わせる。** 一致しないときは、**一致しないこと自体を記録する**——どちらかを正に選ばない。1 箇所だけを読んで断定した記述が実際に 3 件入り込んだ（注文ステータスの英日差を 1 つの節だけで判断した件、`asset_update` のキーを応答例だけで camelCase と断定した件、`spot_order_invalidation` の `params` を「公式通り配列」と書いた件。後の 2 件は下の該当節が持つ）。
+**根拠の読み方**: 公式を根拠に引くときは、**フィールド表・JSON 応答例・本文の注記を全部突き合わせる。英語版と日本語版の両方で。** 一致しないときは、**一致しないこと自体を記録する**——どちらかを正に選ばない。1 箇所だけを読んで断定した記述が実際に 4 件入り込んだ（注文ステータスの英日差を 1 つの節だけで判断した件、`asset_update` のキーを応答例だけで camelCase と断定した件、`spot_order_invalidation` の `params` を「公式通り配列」と書いた件、private stream の注文と約定の表を英語版だけで読み、日本語版も同じ条件だと書いた件。後の 3 件は下の該当節が持つ）。英日の表の食い違いは目で探すと見落とすので、**行ごとに機械的に突き合わせる**こと（4 件目はそれで見つかった）。
 
 **自分の中身を数えた数字を書かない**: 「小節は N ある」「N 節が推測を含む」のように、**項目を足すたびに
 古くなる書き方をしない**——値を更新しても次の追記でまた古くなるので、数を持たない書き方にする。
@@ -547,7 +559,7 @@ Plan A は maker / taker 表示に関わらず**単一の料率**で計算する
 
 ### 信用取引・逆指値の項目
 
-公式の応答表にあっても、本モックが機能を実装しないフィールドはキー自体を出さない。注文: `position_side` / `triggered_at` / `trigger_price`。約定: `position_side` / `profit_loss` / `interest`
+公式の応答表にあっても、本モックが機能を実装しないフィールドはキー自体を出さない。注文: `position_side` / `triggered_at` / `trigger_price`。約定: `position_side` / `profit_loss` / `interest`。private stream の `spot_order_new` / `spot_order` と `spot_trade` も同じ扱い。注文の 3 つは stream の表も英日とも `| undefined` で同じ条件を書く（`private-stream.md:125,127,133` / `private-stream_JP.md:126,128,134`）。**約定の 3 つは stream の表が英日で割れている**——英語版は `| undefined`（`private-stream.md:256,260-261`）、日本語版は `| null`（`private-stream_JP.md:257,261-262`）。本モックは REST の表（英日とも `| undefined`）と英語版に揃えてキーごと出さない
 
 - **根拠**: REST API の各応答表（`position_side` は「only for margin trading」、`triggered_at` / `trigger_price` は「present only if type = `stop`, `stop_limit`, `take_profit`, `stop_loss`」と条件が明記される）
 - **本物との差異**: `profit_loss` / `interest` は型が `string | undefined` とだけ書かれ、省略条件の明記が無い。信用取引の項目なので現物では出ないと判断した（**推測**）
@@ -566,7 +578,7 @@ Plan A は maker / taker 表示に関わらず**単一の料率**で計算する
 
 ### 注文オブジェクトの共通形
 
-注文を返す 5 経路（`GET order` / `POST order` / `cancel_order` / `orders_info` / `active_orders`）は `formatOrder()` の 1 つの整形関数を共有する。経路ごとの形の違いは `canceled_at` の有無だけで、それも注文が取消済みかどうかで決まる
+注文を返す 5 経路（`GET order` / `POST order` / `cancel_order` / `orders_info` / `active_orders`）は `formatOrder()` の 1 つの整形関数を共有する。経路ごとの形の違いは `canceled_at` の有無だけで、それも注文が取消済みかどうかで決まる。private stream の `spot_order_new` / `spot_order` も同じ `formatOrder()` を土台にし、2 フィールドを足すだけである（下の「private stream の注文ペイロード」節）
 
 - **根拠**: REST API: Fetch multiple orders と Fetch active orders は応答を「list of object same as [Fetch order information response]」と定義し、Cancel multiple orders は「list of object same as [Cancel order response]」と定義する。Cancel order の応答表は Fetch order information の表に `canceled_at` を足したもの
 - **本物との差異**: 差異なし
@@ -624,7 +636,7 @@ Plan A は maker / taker 表示に関わらず**単一の料率**で計算する
 
 ### 認証
 
-Plan A は認証ヘッダを検証しない
+Plan A は認証ヘッダを検証しない。private stream の WebSocket（`/_stream/private`）も同じで、`GET /v1/user/subscribe` が返すトークンも接続で見ない（下の「private stream」節）
 
 - **根拠**: REST API は private API に認証を要求
 - **本物との差異**: 意図的に未実装
@@ -705,7 +717,7 @@ Plan A は認証ヘッダを検証しない
 
 ### `/_control/`
 
-`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）
+`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
 
 - **根拠**: 本モック固有
 - **本物との差異**: bitbank API に存在しない
@@ -847,27 +859,94 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream
 
-Phase 5 で PubNub ではなく素の WebSocket を提供する予定
+**素の WebSocket で配信する（PubNub を模さない）。** 接続先は `ws://<host>:<port>/_stream/private`（listen アドレスとポートは互換ルートと同じ）。`GET /v1/user/subscribe` は公式と同じ形 `{ "success": 1, "data": { "pubnub_channel", "pubnub_token" } }` を返すが、**値はダミーの固定文字列**で、WebSocket の接続ではどちらも見ない。送るメソッドは現物の 4 つ（`spot_order_new` / `spot_order` / `spot_trade` / `asset_update`）で、`spot_order_invalidation` は送らない（下の「private stream の `spot_order_invalidation`」節）。**接続した時点の状態は送らない**——接続の後に起きた変化だけが届く。クライアントから送られたフレームは読まずに捨て、1024 バイトを超えるフレームには close code `1009` で閉じる。upgrade でない `GET /_stream/private` には HTTP `426` と素の JSON `{"error":"UPGRADE_REQUIRED"}` を返す
 
-- **根拠**: private stream docs のメッセージ形
-- **本物との差異**: 接続・配信トランスポートが異なる
+- **根拠**: 公式 private stream（`private-stream.md`）のメッセージ形と、REST の Get channel and token for private stream（`rest-api.md:1772-1824` / `rest-api_JP.md:1785-1790`。フィールドは `pubnub_channel` / `pubnub_token` の 2 つ、チャンネルはユーザーごと、トークンの TTL は 12 時間）。トランスポートの決定は計画書 3.4（2026-09-11）
+- **本物との差異**: 接続・配信のトランスポートが異なる（公式は PubNub SDK で購読する）。チャンネル名とトークンを検証せず、トークンの期限切れ（公式は 12 時間で切断）も起こさない。`GET /v1/user/subscribe` は**`store.tick()` を呼ばない唯一の互換ルート**で、状態を読まない（tick すると、再接続の手順の途中のまだ繋がっていない窓で約定のイベントが流れて取りこぼされるため。`src/routes/subscribe.ts`）。`/_stream/private` は bitbank API に存在しない口で、認証も接続元の制限も無い（互換ルートと同じ扱い。上の「認証」節）
 - **推測**: はい
   - 確認先 **利用側と合意**: 配信を PubNub ではなく素の WebSocket で提供すること（利用側の接続層が変わる）
-- **利用側への含意**: 利用側は PubNub SDK ではなく WebSocket 接続層を使う
+  - 確認先 **モックの設計判断**: チャンネル名とトークンをダミーの固定値にし、接続で検証しないこと
+- **利用側への含意**: 利用側は PubNub SDK ではなく WebSocket 接続層を使う。**接続層を差し替え可能にし、メッセージの解釈（`message.method` と `message.params`）は本番と共通にする**のが前提。接続の後に REST で取り直して突き合わせること（接続前の変化は届かない。公式の PubNub も購読前の変化は届けない）。トークンの期限切れからの再接続（公式の Step 5）はこのモックでは踏めないので、本番で初めて通る
+
+### private stream のメッセージ
+
+1 フレームに JSON 1 つで、形は公式と同じ `{ "message": { "method": ..., "params": [...] } }`。**`params` は常に要素 1 つの配列**にし、1 回の状態の変化につき、変わった注文・新しい約定・見え方が変わった資産ごとに 1 通ずつ送る。**1 回の変化の中は注文 → 約定 → 資産の順**に並べる（例: 指値の部分約定は `spot_order` → `spot_trade` → `asset_update` を資産の数だけ）。同じメッセージを 2 度送ることはない
+
+- **根拠**: 公式の応答例（`private-stream.md:89-107` ほか）はいずれも `params` を配列にして要素を 1 つだけ書く（`spot_order_invalidation` だけはオブジェクト。下の同名の節）。公式の例のコード（`private-stream.md:666` / `private-stream_JP.md:667`）は `data.message.params[0]` だけを読む
+- **本物との差異**: **実 API が 1 通に複数の要素を詰めるかは確かめていない**（受信には実弾の口座と PubNub 接続が要る）。1 回の変化の中の並べ方はモックの決め事で、公式は順序を保証しない（下の「private stream の順序」節）
+- **推測**: はい
+  - 確認先 **実 API**: 実 API は、1 つのメッセージの `params` に複数の要素を入れて送ることがありますか
+  - 確認先 **モックの設計判断**: 1 回の変化の中を注文 → 約定 → 資産の順に並べること
+- **利用側への含意**: 公式の例のコードどおり `params[0]` だけを読んでもこのモックでは取りこぼさないが、**本番でも同じとは限らない**。`params` を配列として全要素回す形にしておくのが安全側。並び順には依存しないこと
+
+### private stream の注文ペイロード
+
+`spot_order_new` と `spot_order` は同じ形で、**REST の注文オブジェクト（`formatOrder()`）に `executed_at` と `is_just_triggered` を足したもの**。共通部分の値は同じ時点の `GET order` と一致する。`is_just_triggered` は**常に `false`**。`executed_at` は**常に出し**、値はその注文の約定のうち最も遅い約定時刻、**約定が無ければ `0`**。`price` / `post_only` / `canceled_at` が出る条件と `expire_at: null` は REST と同じ（上の「注文の固定フィールド」節・「`expire_at`」節・「注文の `canceled_at`」節）。**新しく現れた注文は `spot_order_new`、既にあった注文の見え方が変わったら `spot_order`** で、1 回の変化につき 1 注文 1 通なので、**成行は `spot_order_new` が 1 通だけ、`status: "FULLY_FILLED"` で届く**（`UNFILLED` の `spot_order_new` は挟まない）
+
+**フィールド表が英日で 5 行食い違う**（2026-09-27 に英日の表を機械的に突き合わせて見つけた）。REST の注文の表（英日とも）も並べると、モックがどちらに寄せたかが読める。
+
+| フィールド | stream の表（英） | stream の表（日） | REST の表（英日とも） | モック |
+| --- | --- | --- | --- | --- |
+| `canceled_at` | `number`（`private-stream.md:118`） | `number \| undefined`（`private-stream_JP.md:119`） | Cancel order だけが持ち、英 `number`（`rest-api.md:484`）/ 日 `number \| undefined`（`rest-api_JP.md:492`） | 取消済みのときだけ出す |
+| `price` | `string`（`:124`） | `string \| undefined`、limit / stop_limit のときだけ（`:125`） | `string \| undefined`、limit / stop_limit のときだけ（`rest-api.md:302` / `rest-api_JP.md:310`） | 指値のときだけ出す |
+| `remaining_amount` | `string \| null`（`:126`） | `string`（`:127`） | `string \| null` | 常に文字列 |
+| `start_amount` | `string \| null`（`:129`） | `string`（`:130`） | `string \| null` | 常に文字列 |
+| `expire_at` | `number \| null`（`:132`） | `number`（`:133`） | `number \| null`（`rest-api.md:307` / `rest-api_JP.md:315`） | 常に `null` |
+
+**どの行も、モックの値は英日のどちらかの stream の表と REST の表に合っている**（`remaining_amount` / `start_amount` は両方に合う）。どちらかの言語版を正に選んだのではなく、REST から変えていないだけである。**`executed_at` だけは英日とも `number`（`private-stream.md:120` / `private-stream_JP.md:121`）で食い違いが無い**ので、キーを省かない
+
+- **根拠**: 公式のフィールド表（`private-stream.md:115-136` / `private-stream_JP.md:116-137`）と、上の表の REST の行。`spot_order` は「内容は `spot_order_new` と同一」（`private-stream.md:176` / `private-stream_JP.md:177`）。**`spot_order_new` の節の注記は、`FULLY_FILLED` / `CANCELED_*` の通知を受けたら手元の注文情報から消すよう書いており**（`private-stream.md:113` / `private-stream_JP.md:113`）、新規の通知が既に終端の状態で届くことを公式も想定している
+- **本物との差異**: **約定の無い注文の `executed_at` の値（`0`）は応答例の値に合わせただけ**で、実 API が何を返すかは確かめていない。**「どの約定の時刻か」も公式は書いていない**（説明は "order executed at unix timestamp (milliseconds)" だけ）。**`is_just_triggered` はモックに逆指値のトリガという概念が無いので常に偽**（「たった今トリガされた」注文が存在しない）。成行で `UNFILLED` の `spot_order_new` を挟むかは確かめていない。上の表の 5 行は、実 API がどちらの言語版どおりに送るか確かめていない。`status` の enum（`private-stream.md:130`）は `REJECTED` を含まない 6 値で、互換ルートと `/_control/` から `REJECTED` へ到達する経路は無い（上の「注文状態」節）
+- **推測**: はい
+  - 確認先 **実 API**: 約定していない注文の `spot_order_new` / `spot_order` で、実 API は `executed_at` に何を返しますか
+  - 確認先 **実 API**: 実 API の注文ペイロードの `executed_at` は、最初の約定時刻と最後の約定時刻のどちらですか
+  - 確認先 **実 API**: 実 API で成行注文を出したとき、`spot_order_new` は `status` が `FULLY_FILLED` の 1 通だけで届きますか
+  - 確認先 **実 API**: 実 API の `spot_order_new` / `spot_order` は、取り消していない注文や成行注文でも `canceled_at` / `price` のキーを含めますか
+- **利用側への含意**: 注文の追跡は、`spot_order_new` が必ず `UNFILLED` で始まることを前提にしない（公式の注記どおり、終端の状態で届き得る）。**`executed_at` を約定の判定に使わない**（約定が無くても `0` が入る）——`executed_amount` と `status` で判定する。`canceled_at` / `price` のキーの有無、`expire_at` の `null` にも依存しない（英日の表で扱いが割れている）
+
+### private stream の発火契機
+
+**状態が変わるたびに、その変化を送る。** 送る内容は変化の前後の状態の差から作るので（`src/stream/events.ts`）、経路を問わない——互換ルートの発注・取消・一括取消、`/_control/` の fill / tick、**market モードの `tick()` が埋めた約定**のどれでも同じように流れる。**market モードでは読み取りの要求（`GET /v1/user/assets` など）が約定を起こし、そのイベントが流れる**。足による自動の約定を起こすのは `store.tick()` を通る互換ルートで、**`GET /v1/user/subscribe` だけは例外**である（状態を読まないので tick を通らない。上の「private stream」節）。control を有効にしていれば、`/_control/` の fill / tick も market モードのまま約定を起こし、同じようにイベントが流れる。裏で足を見張る仕組みは無いので、**互換ルートにも `/_control/` にも要求が来ない間は約定もイベントも起きない**。manual モードでは、互換ルートの状態を変える要求と `/_control/` の操作でだけ流れる。時計だけを動かす変化（`POST /_control/clock`、tick の末尾の時計の前進）は何も流さない
+
+- **根拠**: 本モック固有（計画書 16 節の決定 13）。公式の約定は市場が動いたときに起き、利用者の要求とは無関係に通知される
+- **本物との差異**: **発火の契機がモック固有**——本物は市場が動いたときに飛ぶが、market モードのモックは「誰かが互換ルート（`GET /v1/user/subscribe` を除く）か `/_control/` の fill / tick を叩いたとき」に飛ぶ。manual モードでは約定は `/_control/` を叩いた時点でだけ起きる
+- **推測**: はい
+  - 確認先 **モックの設計判断**: 読み取りの要求が起こした約定もイベントとして流すこと（流さないと、応答に出ている約定が stream に流れず、状態と stream が食い違う）
+- **利用側への含意**: **「イベントが来ないから約定していない」と学習しないこと。** market モードで約定を stream で受けたいときは、何かの互換ルート（例: `GET /v1/user/spot/active_orders`）を定期的に叩くか、control を有効にして `/_control/` の fill / tick を呼ぶ必要がある。**`GET /v1/user/subscribe` を叩いても約定は進まない**ので、その代わりにはならない。再現性が要るシナリオは manual モードで `/_control/` から起こす
+
+### private stream と永続化の失敗
+
+**イベントはメモリへ反映した直後に送り、書き出しの成否も HTTP 応答も待たない。** そのため (a) 発注の HTTP 応答より先に `spot_order_new` が届くことがあり、(b) 書き出しに失敗して `70001` を返した要求（劣化の引き金になった 1 本）のイベントも流れる。劣化した後は状態を変える要求が断られ `tick()` も止まるので、**以後は何も流れない**（接続は断らない。`GET /_stream/private` は劣化中も通す読み取り経路に入れてある）
+
+- **根拠**: 本モック固有（計画書 16 節の決定 14）。書き出しの失敗の扱いそのものは上の「状態の永続化」節
+- **本物との差異**: 本物に対応する概念が無い。HTTP 応答と stream の到着順は、公式も何も保証していない
+- **推測**: はい
+  - 確認先 **モックの設計判断**: イベントをメモリへ反映した直後に送り、書き出しの成否を待たないこと（劣化中も通す読み取りがメモリの状態を返すのと揃える）
+- **利用側への含意**: **HTTP 応答を見てから stream を待つ順序を前提にしない**（先に届いたイベントの注文 id を、まだ応答の返っていない発注と突き合わせられるようにする）。`70001` を受けた発注でも、stream と照会には注文が現れることがある——劣化モードの「応答は失敗・メモリには残る」の非対称がそのまま見える
+
+### private stream と状態の初期化
+
+`POST /_control/reset` は**イベントを 1 つも送らず、接続中の private stream をすべて close code `1012`（Service Restart）で閉じる**（reason は `state reset by /_control/reset`）。reset の後に繋ぎ直した接続には、以後の変化が通常どおり届く
+
+- **根拠**: 本モック固有。reset は bitbank API に無い操作で、公式にも「状態が丸ごと入れ替わった」を表すメソッドは無い
+- **本物との差異**: 本物に対応する操作が無い
+- **推測**: はい
+  - 確認先 **モックの設計判断**: reset で差分を送らず接続を閉じること（reset は注文 id を 1 から配り直すので、差分を送り続けると利用側の手元で前の注文と新しい注文が同じ id で混ざる）
+- **利用側への含意**: `1012` で切れたら、公式の再接続の手順（`private-stream.md:505-512`）どおり繋ぎ直し、**手元の注文の対応表を捨てて REST で取り直す**。公式の例のコードの「状態が進んだときだけ上書きする」写し方（`private-stream.md:661-684`）のまま接続を保つと、前の注文 1 が `FULLY_FILLED` なら新しい注文 1 の更新がすべて捨てられる。シナリオの冒頭で reset するなら、reset の後に接続する
 
 ### private stream の順序
 
-配信順序・重複なしを保証しない
+**モック自身は順序を入れ替えず、重複も欠落も起こさない**（1 回の変化の中の並び方は上の「private stream のメッセージ」節）。公式が順序を保証しないことに利用側が耐えるかを試すための差し込み口（`DeliveryPolicy`、`src/stream/hub.ts`）を配信の直前に置いてあるが、**Plan A では恒等写像で、外から切り替える手段は無い**
 
-- **根拠**: private stream docs に順序保証の記載なし
-- **本物との差異**: Plan A では障害注入は提供しない
+- **根拠**: 公式の例のコードのコメントが順序を保証しないと明記している（`private-stream.md:659` "Since message order is not guaranteed, ..." / `private-stream_JP.md:660`「メッセージの順序は保証されないため」）。**改訂前はここに「順序保証の記載なし」と書いていたが、例のコードのコメントを読み落としていた**（2026-09-27 に訂正）。重複の有無については公式に記述が無い
+- **本物との差異**: モックは常に発生順・重複なしで届けるので、**本物で起こり得る順序の入れ替わりを踏めない**。障害注入（重複・順序入替・欠落）は計画書 3.4 のとおり Plan B
 - **推測**: はい
-  - 確認先 **実 API**: 実 API の private stream は、メッセージを発生順に重複なく届けることを保証しますか
-- **利用側への含意**: 利用側は順不同・重複を許容して状態を解釈する
+  - 確認先 **実 API**: 実 API の private stream は、同じメッセージを重複して届けることがありますか
+- **利用側への含意**: 利用側は順不同・重複を許容して状態を解釈する（公式の例のコードのように、`status` の段階と `remaining_amount` で「進んだときだけ上書きする」）。**このモックで順序が保たれていることを契約として学習しないこと**
 
 ### private stream の `asset_update` のキー
 
-**キーの命名は未確定。** 公式が同じ節の中で snake_case と camelCase に分かれており、どちらを採るかは R4 実装時に決める（R4 は未実装なので、いま決める必要が無い）
+**既定は camelCase（JSON 応答例の綴り）で、`BITBANK_MOCK_STREAM_ASSET_KEYS=snake` のときだけ snake_case（フィールド表の綴り）で送る。** 公式が同じ節の中で割れており（下の表）、どちらが本物かを確かめていないので、利用側が両方の綴りでパーサを流せるよう切り替えられるようにした。値は同じ時点の `GET /v1/user/assets` の該当資産と同じ文字列（切り捨ての桁も同じ）で、`withdrawing_amount` は出金を模さないので常に 0。**1 通に 1 資産**で、6 フィールドの見え方が変わった資産だけを送る（一覧から消えた資産は 0 として送る）
 
 | 公式の箇所 | 命名 | 行 |
 | --- | --- | --- |
@@ -880,11 +959,13 @@ Phase 5 で PubNub ではなく素の WebSocket を提供する予定
 
 **`docs/plan-lab-mock.md` 3.4 には「公式はこのメッセージだけキーが camelCase」と断定して書いてあったが、これは応答例だけを読んだ誤りだった**（2026-09-21 に訂正）。フィールド表の側は REST の `GET /v1/user/assets`（`rest-api.md:189-201`）と同じ snake_case で、6 フィールドはその 11 フィールドの**名前の部分集合**になっている
 
+**既定を camelCase にした理由（推測）**: 他の 4 メソッドは表も例も snake_case で、**この節の例だけが camelCase** である。snake_case の表は REST の `GET /v1/user/assets` の表から書き起こせるが、camelCase の例をわざわざ手で書く理由は見当たらない。例だけが別の綴りになっているのは、実際のメッセージの形を写した跡と読める。ただし例は全フィールドをダミー値（`"string"` / `0`）で並べた雛形でもあり、決め手にはならない
+
 - **根拠**: 公式 private stream の `asset_update` 節（上の表の 4 箇所）。**固定コミット `0badd680` で確認**
-- **本物との差異**: **R4 は未実装なので、差異になり得る挙動がまだ無い。** 実 API がどちらを送るかは**実測していない**（private stream の受信には実弾の口座と PubNub 接続が要る）
-- **推測**: 判断を保留している。**どちらかを選んでいないので推測も置いていない**
+- **本物との差異**: **実 API がどちらを送るかは実測していない**（private stream の受信には実弾の口座と PubNub 接続が要る）。どちらの綴りを既定にしても、本物と食い違う可能性が残る
+- **推測**: はい（既定の綴り）
   - 確認先 **実 API**: 実 API の `asset_update` は、キーを snake_case（`free_amount`）と camelCase（`freeAmount`）のどちらで送りますか
-- **利用側への含意**: **この形は未確定なので、`asset_update` のキー名を前提にしたパーサを先に書かないこと。** 両方の綴りを受けられる形にしておくか、R4 の実装が決まってから書くのが安全側である
+- **利用側への含意**: **両方の綴りを受けられるパーサにし、`BITBANK_MOCK_STREAM_ASSET_KEYS` を切り替えて両方で流して確かめる。** 実 API の答えが出るまで、どちらか一方を前提にしたパーサを書かないこと
 
 ### private stream の `spot_order_invalidation`
 

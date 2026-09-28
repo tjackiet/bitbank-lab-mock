@@ -1,3 +1,4 @@
+import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { activeOrdersRoutes } from "../routes/active-orders.ts";
 import { assetsRoutes } from "../routes/assets.ts";
@@ -5,15 +6,20 @@ import { cancelOrderRoutes } from "../routes/cancel-order.ts";
 import { controlRoutes } from "../routes/control.ts";
 import { createOrderRoutes } from "../routes/create-order.ts";
 import { ErrorCode, err } from "../routes/envelope.ts";
+import type { AssetKeyStyle } from "../routes/format.ts";
 import { orderInfoRoutes } from "../routes/order-info.ts";
+import { privateStreamRoutes } from "../routes/private-stream.ts";
+import { subscribeRoutes } from "../routes/subscribe.ts";
 import { tradeHistoryRoutes } from "../routes/trade-history.ts";
 import type { SessionStore } from "../store/session.ts";
-import { controlToken, isControlEnabled } from "./config.ts";
+import { type DeliveryPolicy, PrivateStreamHub } from "../stream/hub.ts";
+import { controlToken, isControlEnabled, streamAssetKeys } from "./config.ts";
 import { assertRouteClassified, degradedResponse, isReadRoute } from "./degraded.ts";
 
 declare module "fastify" {
   interface FastifyInstance {
     store: SessionStore;
+    privateStream: PrivateStreamHub;
   }
 }
 
@@ -22,7 +28,18 @@ export type BuildServerOptions = {
   logger?: boolean;
   controlEnabled?: boolean;
   controlToken?: string;
+  /** 省略時は `BITBANK_MOCK_STREAM_ASSET_KEYS`（既定 `camel`）。 */
+  streamAssetKeys?: AssetKeyStyle;
+  /** 省略時は `passThrough`（恒等写像）。障害注入の差し込み口（`src/stream/hub.ts`）。 */
+  deliveryPolicy?: DeliveryPolicy;
 };
+
+/**
+ * private stream の WebSocket でクライアントから受け付ける 1 フレームの最大長（バイト）。
+ * このモックはクライアントからの入力を 1 つも読まない（`src/routes/private-stream.ts`）ので、
+ * 捨てるだけのものにメモリを使わせないよう小さく絞る。超えると `ws` が接続を閉じる。
+ */
+const STREAM_MAX_PAYLOAD = 1024;
 
 /**
  * 劣化中に断る判定と応答を 1 箇所に置く。**ルートごとには手当てしない。**
@@ -119,17 +136,42 @@ function registerNotFoundHandler(fastify: FastifyInstance): void {
   });
 }
 
+/**
+ * private stream の配信元を作って store に繋ぐ。**購読はサーバの寿命と同じ**で、
+ * `fastify.close()` で外す（接続中の WebSocket は `@fastify/websocket` の `preClose` が閉じる）。
+ */
+function registerPrivateStream(
+  fastify: FastifyInstance,
+  opts: BuildServerOptions,
+): PrivateStreamHub {
+  const hub = new PrivateStreamHub(opts.store, {
+    assetKeys: opts.streamAssetKeys ?? streamAssetKeys(),
+    deliveryPolicy: opts.deliveryPolicy,
+    logger: fastify.log,
+  });
+  hub.start();
+  fastify.addHook("onClose", async () => hub.stop());
+  fastify.decorate("privateStream", hub);
+  return hub;
+}
+
 export async function buildServer(opts: BuildServerOptions): Promise<FastifyInstance> {
   const fastify = Fastify({ logger: opts.logger ?? false });
   fastify.decorate("store", opts.store);
   registerDegradedGuard(fastify, opts.store);
   registerNotFoundHandler(fastify);
+  const hub = registerPrivateStream(fastify, opts);
+  // WebSocket のルートを登録する前に入れる（`websocket: true` / `wsHandler` を解釈する
+  // `onRoute` フックはこのプラグインが足す）。
+  await fastify.register(websocket, { options: { maxPayload: STREAM_MAX_PAYLOAD } });
   await fastify.register(assetsRoutes);
   await fastify.register(activeOrdersRoutes);
   await fastify.register(tradeHistoryRoutes);
   await fastify.register(createOrderRoutes);
   await fastify.register(orderInfoRoutes);
   await fastify.register(cancelOrderRoutes);
+  await fastify.register(subscribeRoutes);
+  await fastify.register(privateStreamRoutes, { hub });
   const enabled = opts.controlEnabled ?? isControlEnabled();
   if (enabled) {
     await fastify.register(controlRoutes, {

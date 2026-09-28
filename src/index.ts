@@ -1,4 +1,5 @@
 import { defaultStatePath, sweepOrphanTempFiles } from "./engine/persist.ts";
+import { PRIVATE_STREAM_PATH } from "./routes/private-stream.ts";
 import { fillMode, isControlEnabled, listenHost, persistFailureMode } from "./server/config.ts";
 import { buildServer } from "./server/http.ts";
 import { acquireStateLock, StateLockedError } from "./store/lock.ts";
@@ -103,6 +104,8 @@ async function main() {
     `bitbank-lab-mock listening on http://${host}:${port} fillMode=${mode} ` +
       `persistFailure=${persistMode}${control ? " control=on" : ""}`,
   );
+  // private stream は PubNub ではなく素の WebSocket なので、接続先を起動時に見せておく。
+  console.log(`private stream: ws://${host}:${port}${PRIVATE_STREAM_PATH}`);
 }
 
 main().catch((e) => {
