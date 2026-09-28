@@ -1073,7 +1073,7 @@ const dates = new Set<string>([ymdJst(fromMs), ymdJst(toMs)]);
 （`GET /v1/user/assets` の応答に出ている約定が stream に流れない）。このモックが一番避けたい
 食い違いなので採らない。「`fillMode: manual` を既定にする」は既定の変更で、control を使わない
 利用者の体験を変えるので R4 の範囲を超える。残る「そのまま発火させる」を採り、代償
-（**発火の契機がモック固有で、誰も互換ルートか `/_control/` の fill / tick を叩かない限り静か**）は `docs/fidelity.md` の
+（**発火の契機がモック固有で、誰も `GET /v1/user/subscribe` 以外の互換ルートか `/_control/` の fill / tick を叩かない限り静か**）は `docs/fidelity.md` の
 「private stream の発火契機」節に書いて利用側へ渡す。
 
 `asset_update` の発火情報は、14.2 の 2 案（`commit()` の前後で資産を比較する／遷移の戻り値に
