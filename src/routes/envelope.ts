@@ -37,6 +37,17 @@ export const ErrorCode = {
    * `/v1/user/` 配下だけは実 API に合わせて 200 + `20003`。`/_control/` は対象外）。
    */
   URL_NOT_FOUND: 10000,
+  /**
+   * "You sent requests too frequently. Retry later with decreased requests."（`errors.md:42`）。
+   * 実 API はレート制限を超えた要求に **HTTP 429** とこの番号の封筒を返す（2026-09-17 に実測。
+   * `docs/fidelity.md` の「レート制限」節）。
+   *
+   * **モックが返すのは `/_control/faults` で `rate_limit` を注入したときだけ**で、回数を数える
+   * レート制限は持たない（`docs/plan-lab-mock.md` 18.2 の決定 32）。返す経路は
+   * `src/server/faults.ts` の 1 か所で、HTTP ステータスを 429 にするのもそこである（`err()` は
+   * ステータスに触らない）。
+   */
+  TOO_MANY_REQUESTS: 10009,
   INVALID_AUTH: 20001,
   INVALID_PARAMETER: 20003,
   MISSING_AMOUNT: 30001,

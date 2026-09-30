@@ -73,6 +73,7 @@
 | 注文・約定・残高の変化の push 受信 | **一部** | `GET /_stream/private`（WebSocket）と `GET /v1/user/subscribe` | [private stream](fidelity.md#private-stream) / [private stream のメッセージ](fidelity.md#private-stream-のメッセージ) / [private stream の発火契機](fidelity.md#private-stream-の発火契機) |
 | push の順序の入れ替わり・重複・欠落を起こす手段 | 対応 | `POST /_control/stream/hold` / `GET /_control/stream/held` / `POST /_control/stream/release` | [private stream の順序](fidelity.md#private-stream-の順序) / [private stream の保留・再送](fidelity.md#private-stream-の保留再送) |
 | 注文を `REJECTED` にする手段 | 対応 | `POST /_control/orders/:order_id/reject` | [注文状態](fidelity.md#注文状態) / [`/_control/`](fidelity.md#_control) / [private stream の注文ペイロード](fidelity.md#private-stream-の注文ペイロード) |
+| REST の 429・5xx・応答不明を起こす手段 | **一部** | `POST /_control/faults` / `GET /_control/faults` / `DELETE /_control/faults/:id` / `DELETE /_control/faults` | [REST の障害注入](fidelity.md#rest-の障害注入) / [レート制限](fidelity.md#レート制限) |
 
 「**一部**」と書いたものは、対応してはいるが**範囲に条件が付く**もの。条件そのものは上の節で読む。
 
@@ -90,6 +91,10 @@
   保留・再送（`/_control/stream/*`）で、指定したとおりにしか起きない（時間で遅らせる注入・乱数での注入は無い）。
   条件は [`fidelity.md` の「private stream の発火契機」](fidelity.md#private-stream-の発火契機)と
   [`fidelity.md` の「private stream と状態の初期化」](fidelity.md#private-stream-と状態の初期化)にある
+- **REST の 429・5xx・応答不明** — 起きるのは **`/_control/faults` で登録したときだけ**で、「次の N 回の（メソッド, パス）」に
+  指定したとおりにしか起きない（回数を数えるレート制限は無く、ポーリングが枠に収まっているかは確かめられない）。
+  **5xx の本文と、実 API がいつ 5xx を返すかは推測**である。条件は
+  [`fidelity.md` の「REST の障害注入」](fidelity.md#rest-の障害注入)にある
 
 ### 実装しているエンドポイント
 

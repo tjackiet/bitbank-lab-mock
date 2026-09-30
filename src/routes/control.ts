@@ -5,12 +5,22 @@ import { runTick } from "../engine/match.ts";
 import { fitsDigits, precisionOf } from "../engine/precision.ts";
 import { freshState, isActive, latestRecordMs, pairAssets, remainingOf } from "../engine/state.ts";
 import { fillOrder, rejectOrder } from "../engine/transitions.ts";
+import type { FaultInjector } from "../server/faults.ts";
 import { formatOrder, formatTrade } from "./format.ts";
 import { asRecord } from "./params.ts";
 
 export type ControlRouteOptions = {
   token?: string;
+  /** REST の障害注入（`/faults`）の持ち主。`buildServer()` が互換ルートにフックを掛けたものを渡す。 */
+  faults: FaultInjector;
 };
+
+/** `DELETE /_control/faults/:id` の id。10 進の正の整数でなければ `null`（該当なしとして 404）。 */
+function faultId(raw: unknown): number | null {
+  if (typeof raw !== "string" || !/^[1-9][0-9]*$/.test(raw)) return null;
+  const id = Number(raw);
+  return Number.isSafeInteger(id) ? id : null;
+}
 
 function isLoopback(ip: string | undefined): boolean {
   if (!ip) return false;
@@ -576,4 +586,43 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
     }
     return invalid();
   });
+
+  /*
+   * REST の障害注入。互換ルートの「次の N 回の（メソッド, パス）」に、429・5xx・応答不明・
+   * 状態を変えたうえでの 5xx を起こす（`docs/fidelity.md` の「REST の障害注入」節）。登録は
+   * `FaultInjector` のメモリにあり、`PaperState` にも状態ファイルにも入らない。そのため劣化中も
+   * 通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。reset で捨てる。
+   */
+
+  /**
+   * 登録する。本文は `{ method, path, kind, count?, status? }`（形は `FaultInjector.register()`）。
+   *
+   * - 形が違う・知らないキーがある: 400 `INVALID_FAULT`
+   * - （メソッド, パス）が互換ルートでない（`/_control/` と `/_stream/private` を含む）・モックに無い:
+   *   400 `INVALID_FAULT_TARGET`。当てられる（メソッド, パス）の一覧を `targets` に添える
+   */
+  fastify.post("/faults", async (request, reply) => {
+    const r = opts.faults.register(request.body);
+    if (r.success) return { fault: r.data };
+    if (r.error === "INVALID_FAULT_TARGET") {
+      return reply
+        .code(400)
+        .send({ error: "INVALID_FAULT_TARGET", targets: opts.faults.targetKeys() });
+    }
+    return reply.code(400).send({ error: "INVALID_FAULT" });
+  });
+
+  /** 登録した順に返す。残り回数が 0 になった登録も、当たった回数（`hits`）を付けて残す。 */
+  fastify.get("/faults", async () => ({ faults: opts.faults.list() }));
+
+  /** 1 件取り消す。無ければ 404 `FAULT_NOT_FOUND`。 */
+  fastify.delete("/faults/:id", async (request, reply) => {
+    const id = faultId((request.params as { id?: unknown }).id);
+    const removed = id === null ? null : opts.faults.cancel(id);
+    if (removed === null) return reply.code(404).send({ error: "FAULT_NOT_FOUND" });
+    return { fault: removed };
+  });
+
+  /** すべて取り消す。 */
+  fastify.delete("/faults", async () => ({ removed: opts.faults.clear() }));
 };

@@ -15,6 +15,7 @@ import type { SessionStore } from "../store/session.ts";
 import { type DeliveryPolicy, PrivateStreamHub } from "../stream/hub.ts";
 import { controlToken, isControlEnabled, streamAssetKeys } from "./config.ts";
 import { assertRouteClassified, degradedResponse, passesWhileDegraded } from "./degraded.ts";
+import { FaultInjector, registerFaultInjection } from "./faults.ts";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -161,12 +162,28 @@ function registerPrivateStream(
   return hub;
 }
 
+/**
+ * REST の障害注入を足す（`src/server/faults.ts`）。**control が有効なときだけ**——故障を登録する口が
+ * `/_control/` にしか無いので、無効なら互換ルートにフックすら掛けない。互換ルートを登録する前に
+ * 呼ぶ（`onRoute` で故障を当てられる経路を集める）。reset で登録を捨てるための store の購読は、
+ * サーバの寿命と同じ（`fastify.close()` で外す）。
+ */
+function registerFaults(fastify: FastifyInstance, store: SessionStore): FaultInjector {
+  const injector = new FaultInjector(store);
+  injector.start();
+  fastify.addHook("onClose", async () => injector.stop());
+  registerFaultInjection(fastify, injector);
+  return injector;
+}
+
 export async function buildServer(opts: BuildServerOptions): Promise<FastifyInstance> {
   const fastify = Fastify({ logger: opts.logger ?? false });
   fastify.decorate("store", opts.store);
   registerDegradedGuard(fastify, opts.store);
   registerNotFoundHandler(fastify);
   const hub = registerPrivateStream(fastify, opts);
+  const enabled = opts.controlEnabled ?? isControlEnabled();
+  const faults = enabled ? registerFaults(fastify, opts.store) : null;
   // WebSocket のルートを登録する前に入れる（`websocket: true` / `wsHandler` を解釈する
   // `onRoute` フックはこのプラグインが足す）。
   await fastify.register(websocket, { options: { maxPayload: STREAM_MAX_PAYLOAD } });
@@ -178,11 +195,12 @@ export async function buildServer(opts: BuildServerOptions): Promise<FastifyInst
   await fastify.register(cancelOrderRoutes);
   await fastify.register(subscribeRoutes);
   await fastify.register(privateStreamRoutes, { hub });
-  const enabled = opts.controlEnabled ?? isControlEnabled();
-  if (enabled) {
+  // `faults` は control が有効なときだけ作るので、これは control の有効・無効の判定でもある。
+  if (faults !== null) {
     await fastify.register(controlRoutes, {
       prefix: "/_control",
       token: opts.controlToken ?? controlToken(),
+      faults,
     });
   }
   return fastify;

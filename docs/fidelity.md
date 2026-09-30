@@ -62,6 +62,7 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [`/_control/`](#_control) — `GET /_control/state` に状態ファイルへの書き出しの状況（`persist`）を添える
 - [足の取得の健全性](#足の取得の健全性) — `GET /_control/state` に足の取得の状況（`candles`）を添える（取得に失敗しても互換ルートは成功応答のまま。改訂前: 失敗は warn に出るだけで、応答からは見えなかった）
 - [`/_control/`](#_control) / [注文状態](#注文状態) — `POST /_control/orders/:order_id/reject` を足し、`UNFILLED` / `INACTIVE` の注文を `REJECTED` にできるようにした（private stream には `REJECTED` の `spot_order` が流れる。改訂前: `REJECTED` へ到達する口が無く、状態ファイルが最初からその状態を持っていたときだけ現れた）
+- [REST の障害注入](#rest-の障害注入) / [レート制限](#レート制限) — `POST /_control/faults` ほかを足し、互換ルートの「次の N 回の（メソッド, パス）」に 429（封筒 `10009`）・5xx・応答不明・状態を変えたうえでの 5xx を起こせるようにした（改訂前: 互換ルートは 429 も 5xx も返さず、応答は必ず返った。**control を有効にして故障を登録しない限り、挙動は変わらない**）
 
 ### private stream（`/_stream/private`）
 
@@ -183,6 +184,8 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [拘束額](#拘束額) — 実 API の成行買いでも、拘束額に手数料が乗りますか
 - [同時未約定注文の上限](#同時未約定注文の上限) — 実 API は、`INACTIVE` の注文を同時発注の上限 30 件に数えますか
 - [成行注文の価格上限](#成行注文の価格上限) — 実 API の成行注文には、約定価格の上限（許容幅）がありますか
+- [REST の障害注入](#rest-の障害注入) — 実 API が 5xx を返すとき、本文は bitbank の封筒ですか、それ以外ですか
+- [REST の障害注入](#rest-の障害注入) — 実 API の 429 の応答には、`Retry-After` のような再試行の間隔を示すヘッダが付きますか
 - [公開 Candlestick の消費](#公開-candlestick-の消費) — 公開 API の `candlestick/1min/{YYYYMMDD}` の日付は、JST（UTC+9）の日付境界で切られますか
 - [公開 Candlestick の消費](#公開-candlestick-の消費) — 公開 API の `candlestick` 配列は、1 つの要求に対して複数の要素を返すことがありますか
 - [公開 Candlestick の消費](#公開-candlestick-の消費) — 公開 API の `candlestick` は、足が 1 本も無いとき空配列を返しますか
@@ -486,7 +489,7 @@ Plan A は maker / taker 表示に関わらず**単一の料率**で計算する
 **複数のフィールドが同時に落ちたときの優先順は `pair` → `amount` → `side` → `type` → `price`。** 欠落の検査（`src/routes/create-order.ts` の `missingCreateOrderCode()`）が採っている並びに揃えた。**この並びが実 API の優先順である裏は取れていない**——元は rest-api.md のパラメータ表の並びで、欠落側に入れたときの留保をそのまま引き継ぐ。並びの出典は `src/routes/params.ts` の `CREATE_ORDER_PARAM_ORDER` 1 か所で、欠落と不正値で食い違わないようにしてある
 
 - **根拠**: errors.md（コミット `0badd680`）。**今回足した 4 つは `errors.md:104` / `113` / `114` / `116`**——`40001` "Invalid order quantity."、`40020` "Invalid order price."、`40021` "Invalid order side."、`40024` "Invalid order type."（`40001` の "order quantity" は rest-api.md のパラメータ名 `amount` に当たる）。**`30009`「Missing asset.」と `40017`「Invalid asset.」は 2026-09-17 に実 API で実測**（`btc_jpy`、認証済みの口座）。`pair` の欠落 → `30009` を 3 経路で確認（`GET order` / `POST orders_info` / **`POST order`**。最後のものは `pair` が無いと取引できる先が無いので注文は成立しない）。**不正なペア → `40017` は照会系 4 経路すべてで確認**（`GET order` / `GET active_orders` / `GET trade_history` / `POST orders_info` に `pair=xxx_yyy`）。`POST order` に `pair: "   "`（空白のみ）も `40017`
-- **本物との差異**: 全 error code は網羅しない。HTTP は**互換ルートの失敗をすべて 200** に揃えた（実 API の実測に合わせた。**観測した範囲とそこからの外挿**は下の「封筒に包まれない応答」節）。`src/routes/envelope.ts` の `ErrorCode` に errors.md で定義されない番号は置かない。**今回割り振った `40001` / `40020` / `40021` / `40024` を実 API が実際に返すことは実測していない**——発注は実弾になるため測れず、`errors.md` の意味から選んだだけである。**そして改訂前の `20003` / `60004` も実測で選ばれたものではなかった。** どちらも推測であり、**公式の意味に近い方へ寄せた**、というのが今回の変更の中身である。取消 2 経路へ入れた `40013` / `40014` も同じ性質で、照会経路の実測（2026-09-17）からの外挿（上の「パラメータの型強制」節）
+- **本物との差異**: 全 error code は網羅しない。HTTP は**互換ルートの失敗をすべて 200** に揃えた（実 API の実測に合わせた。**観測した範囲とそこからの外挿**は下の「封筒に包まれない応答」節。`/_control/faults` で注入した 429 / 5xx だけは例外で、下の「REST の障害注入」節）。`src/routes/envelope.ts` の `ErrorCode` に errors.md で定義されない番号は置かない。**今回割り振った `40001` / `40020` / `40021` / `40024` を実 API が実際に返すことは実測していない**——発注は実弾になるため測れず、`errors.md` の意味から選んだだけである。**そして改訂前の `20003` / `60004` も実測で選ばれたものではなかった。** どちらも推測であり、**公式の意味に近い方へ寄せた**、というのが今回の変更の中身である。取消 2 経路へ入れた `40013` / `40014` も同じ性質で、照会経路の実測（2026-09-17）からの外挿（上の「パラメータの型強制」節）
 - **推測**: はい（`40001` / `40020` / `40021` / `40024` の選択、取消経路の `40013` / `40014`（問いは下の「パラメータの型強制」節が持つ）、複数フィールドが同時に落ちたときの優先順、`20003` の流用）。いいえ（`30009` と `40017` の使い分け、絞り込みパラメータの専用コードは実測）
   - 確認先 **実 API**: `amount` が非正または数値として読めない発注に、実 API は `40001` を返しますか
   - 確認先 **実 API**: `price` が非正または数値として読めない指値の発注に、実 API は `40020` を返しますか
@@ -652,16 +655,16 @@ Plan A は認証ヘッダを検証しない。private stream の WebSocket（`/_
 
 ### レート制限
 
-実装しない
+**回数を数えるレート制限は実装しない。** どれだけ叩いても、上限を超えたことを理由に 429 を返すことはない。**429 は `/_control/faults` で `rate_limit` を注入したときだけ返す**（HTTP 429 + 封筒 `{"success":0,"data":{"code":10009}}`。下の「REST の障害注入」節。計画書 18.2 の決定 32）
 
 - **根拠**: REST API: QUERY 10/s、UPDATE 6/s、超過時 429。**error code は `10009`**（errors.md「You sent requests too frequently. Retry later with decreased requests.」。2026-09-17 に実 API で `HTTP 429` + 封筒 `10009` を実測）
-- **本物との差異**: 意図的に未実装
+- **本物との差異**: 回数を数える制限は意図的に未実装（数えるとテストが時間に依存するため）。注入した 429 の応答の形（HTTP 429 + 封筒 `10009`）は実測に合わせてある
 - **推測**: いいえ
-- **利用側への含意**: 負荷・429 復旧の実験には使えない。**利用側は `10009` と 429 を再試行の合図として扱う**（モックは決して返さない）
+- **利用側への含意**: 負荷の実験と、**ポーリングが枠に収まっているかの確認には使えない**（利用側が自分の要求を数えて確かめる）。429 を受けたときの振る舞いは、`/_control/faults` の注入で踏める。**利用側は `10009` と 429 を再試行の合図として扱う**（モックは注入したときだけ返す）
 
 ### 封筒に包まれない応答
 
-互換ルート（`/v1/user/...`）のうち、**Fastify が route ハンドラへ入る前に返す応答は bitbank 封筒ではない**。(a) `content-type: application/json` で本文が壊れた JSON（`__proto__` キーを含む本文も同じ扱い）は `{"statusCode":400,"code":"FST_ERR_CTP_INVALID_JSON_BODY",...}`、(b) **未登録のパス・メソッドは封筒に包むようになった**（実 API の実測に合わせた。下記）。`/_control/` の未登録パスだけは従来どおり `{"message":"Route ... not found","error":"Not Found","statusCode":404}`、(c) ハンドラ内の未捕捉例外は `{"statusCode":500,...}` で例外メッセージが出る（**現状、互換ルートのハンドラから出る未捕捉例外は無い**。`applyFill()` の throw を `Result` へ変えて、state ファイル由来の 2 経路——採番の飽和と `startAmount == 0`——を塞いだ）。**モックは**、ハンドラが**扱った**失敗（欠落・不正値・不正なペア `40017`・数量の桁溢れ `40001`・残高不足 `60001`・`50009` などの照会エラー）を **HTTP 200 + 封筒**で返す。上の (c) の未捕捉例外だけはこの規則の外で、封筒に包まれない素の 500 になる（現状その経路は無い）。**v0.1.0 からの改訂。改訂前はルート層で弾いた欠落・不正値だけ 400 にしていた**。**実 API で確かめたのは 2026-09-17 の 17 経路ぶんで**（`btc_jpy`、認証済みの口座）、その範囲では失敗が HTTP のステータスで分かれず 200 で返った。**モックが失敗を一律 200 に揃えているのは、そこからの外挿である**——実 API が返し得る失敗を全部測ったわけではない（発注を伴うものは実弾になるため測れない）。失敗は封筒の `success: 0` だけが表す
+互換ルート（`/v1/user/...`）のうち、**Fastify が route ハンドラへ入る前に返す応答は bitbank 封筒ではない**。(a) `content-type: application/json` で本文が壊れた JSON（`__proto__` キーを含む本文も同じ扱い）は `{"statusCode":400,"code":"FST_ERR_CTP_INVALID_JSON_BODY",...}`、(b) **未登録のパス・メソッドは封筒に包むようになった**（実 API の実測に合わせた。下記）。`/_control/` の未登録パスだけは従来どおり `{"message":"Route ... not found","error":"Not Found","statusCode":404}`、(c) ハンドラ内の未捕捉例外は `{"statusCode":500,...}` で例外メッセージが出る（**現状、互換ルートのハンドラから出る未捕捉例外は無い**。`applyFill()` の throw を `Result` へ変えて、state ファイル由来の 2 経路——採番の飽和と `startAmount == 0`——を塞いだ）。**モックは**、ハンドラが**扱った**失敗（欠落・不正値・不正なペア `40017`・数量の桁溢れ `40001`・残高不足 `60001`・`50009` などの照会エラー）を **HTTP 200 + 封筒**で返す。上の (c) の未捕捉例外だけはこの規則の外で、封筒に包まれない素の 500 になる（現状その経路は無い）。**v0.1.0 からの改訂。改訂前はルート層で弾いた欠落・不正値だけ 400 にしていた**。**実 API で確かめたのは 2026-09-17 の 17 経路ぶんで**（`btc_jpy`、認証済みの口座）、その範囲では失敗が HTTP のステータスで分かれず 200 で返った。**モックが失敗を一律 200 に揃えているのは、そこからの外挿である**——実 API が返し得る失敗を全部測ったわけではない（発注を伴うものは実弾になるため測れない）。失敗は封筒の `success: 0` だけが表す。**`/_control/faults` で注入した故障はこの規則の外で返る**——429 は封筒に包んだうえで HTTP 429、5xx は封筒にも JSON にも包まない素の文字列（下の「REST の障害注入」節）
 
 - **根拠**: 本モック固有（Fastify の既定ハンドラ）
 - **本物との差異**: **実 API の未登録パスは 3 通りに分かれる**（2026-09-17 実測）。`/v1/` 直下（`/v1/nonexistent`、認証ヘッダ無し）は `HTTP 404` + 封筒 `10000`（"Url not found."）。`/v1/user/` 配下（`/v1/user/spot/ping`）は認証ヘッダ無しで `HTTP 200` + 封筒 `20003`（"ACCESS-KEY not found."）、**有りで `HTTP 200` + 封筒 `20001`**（"Authentication failed api authorization."）。**実 API は認可をルーティングより先に走らせており、パスの打ち間違いが認証エラーに見える。** モックは `20003` の側だけを再現する（認証ヘッダを検証しないため。`20001` との出し分けはヘッダを見ることになり README の「認証は非目標」に触れるのでしない）。壊れた本文・内部エラーに対する本物の応答は確認できていない
@@ -723,7 +726,7 @@ Plan A は認証ヘッダを検証しない。private stream の WebSocket（`/_
 
 ### `/_control/`
 
-`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/orders/:id/reject`（`UNFILLED` / `INACTIVE` の注文を `REJECTED` にする。下の段落）、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`POST /_control/stream/hold`・`GET /_control/stream/held`・`POST /_control/stream/release`（private stream の保留・再送。同じ表の「private stream の保留・再送」節）、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。仮想時計のときは `clock: { mode: "virtual" }` も添える（同じ表の「仮想時計」節。実時刻モードでは付けない）。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。保留・再送の 3 つは状態ファイルに書かないので劣化中も通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
+`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/orders/:id/reject`（`UNFILLED` / `INACTIVE` の注文を `REJECTED` にする。下の段落）、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`POST /_control/stream/hold`・`GET /_control/stream/held`・`POST /_control/stream/release`（private stream の保留・再送。同じ表の「private stream の保留・再送」節）、`POST /_control/faults`・`GET /_control/faults`・`DELETE /_control/faults/:id`・`DELETE /_control/faults`（REST の障害注入。同じ表の「REST の障害注入」節）、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。仮想時計のときは `clock: { mode: "virtual" }` も添える（同じ表の「仮想時計」節。実時刻モードでは付けない）。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。保留・再送の 3 つと障害注入の 4 つは状態ファイルに書かないので劣化中も通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
 
 **`reject` は `fill` と対になる口である。** 本文は読まず、`UNFILLED` / `INACTIVE` の注文を `REJECTED` にして、`{ "order": … }` を返す（`order` は `fill` の応答の `order` と同じ形で、値は同じ時点の `GET order` と同じ。約定は起きないので `trade` は持たない）。存在しない注文は 404 `{"error":"ORDER_NOT_FOUND"}`、それ以外の状態は 409 `{"error":"ORDER_NOT_ACTIVE","status":…}` で、どちらも状態を変えない。**部分約定済みの注文を断るのは不変量 2**（`REJECTED` の約定量は 0。下の「6 本の不変量」）のためで、約定した分を残して止めたいなら取消（`CANCELED_PARTIALLY_FILLED`）を使う。残高は動かさず、拘束だけが外れる（拘束は active な注文から計算する）。取消ではないので `canceled_at` は埋めず、拒否した時刻は REST の応答に出ない。private stream には `REJECTED` の `spot_order` と、拘束が外れた資産の `asset_update` が流れる（保留中なら他のメッセージと同じく溜まる。同じ表の「private stream の注文ペイロード」節）
 
@@ -803,6 +806,42 @@ control 有効時の既定は `BITBANK_MOCK_FILL_MODE=manual`。`store.tick()` �
 - **推測**: はい
   - 確認先 **モックの設計判断**: fill / tick / clock / reset の入力をどこまで検証し、何で断るか
 - **利用側への含意**: 実験用の部分約定は control からのみ起こす。利用側の通常経路では使わない
+
+### REST の障害注入
+
+**`/_control/faults` から、互換ルート（`/v1/user/...`）の「次の N 回の（メソッド, パス）」に故障を起こせる**（計画書 18.2 の要判断事項 29〜34・36）。乱数も時間も使わず、登録したとおりにしか起きない。故障の種類（`kind`）は 4 つ。
+
+| `kind` | 状態 | 応答 |
+| --- | --- | --- |
+| `rate_limit` | 変えない | HTTP 429 + 封筒 `{"success":0,"data":{"code":10009}}`（`application/json`） |
+| `server_error` | 変えない | 5xx（`status`。既定 500）。本文は**ステータスの理由句の素の文字列**（`text/plain`。500 なら `Internal Server Error`、Node に理由句の無い番号なら `Server Error`） |
+| `no_response` | **変える** | **応答を 1 バイトも返さずに接続を切る**（curl は `(52) Empty reply from server`、Node の `http` は `socket hang up`） |
+| `server_error_after_apply` | **変える** | `server_error` と同じ形の 5xx（応答からはどちらか区別できない） |
+
+| 口 | 本文 / 応答 |
+| --- | --- |
+| `POST /_control/faults` | 本文 `{ method, path, kind, count?, status? }`。応答は `{ fault }` |
+| `GET /_control/faults` | `{ faults: [...] }`（登録した順）。1 件は `{ id, method, path, kind, status, count, remaining, hits }`。`status` は `rate_limit` なら 429、`no_response` なら `null` |
+| `DELETE /_control/faults/:id` | 1 件取り消して `{ fault }`。無ければ 404 `{"error":"FAULT_NOT_FOUND"}` |
+| `DELETE /_control/faults` | すべて取り消して `{ removed }`（件数） |
+
+- **登録の検査**: `method` と `path` は登録済みの互換ルートと完全に一致する文字列（大文字小文字を区別し、クエリ付きのパスは一致しない。`HEAD` は `GET` と同じ鍵で、一覧には `GET` で出る）。`GET /v1/user/subscribe` も対象に入る。`/_control/` と `/_stream/private`、モックに無い（メソッド, パス）は 400 `{"error":"INVALID_FAULT_TARGET","targets":[...]}`（`targets` は当てられる（メソッド, パス）の一覧）。`count` は省略で 1、正の安全な整数。`status` は 5xx の 2 種類だけが受け、省略で 500、500〜599 の整数。数を文字列から強制しない。**知らないキーがあれば断る**（打ち間違いを既定値で黙って通さない）。形が違えば 400 `{"error":"INVALID_FAULT"}` で、形を先に見る
+- **当て方**: **同じ（メソッド, パス）の登録は、登録した順に使い切る**（先の登録の残りが 0 になってから次が当たる）。「429 を 2 回、その次に応答不明」のような列を 1 度の準備で組める。**要求の中身に依らず当たる**——壊れた JSON 本文にも、検証で断られる要求にも当たって回数を減らす。並行に送った要求のどれに当たるかは、モックに届いた順で決まる
+- **いつ返すか**: `rate_limit` と `server_error` は**ハンドラへ入る前**（本文の解析より前）に返す。market モードの `tick()` も走らないので、足を取りに行かず約定も起きない。`no_response` と `server_error_after_apply` は**ハンドラを最後まで通して**、状態の差し替え・private stream の配信（保留中なら溜める。特例は無い）・状態ファイルへの書き出しまで済ませてから、送る直前に切るか 5xx に差し替える。書き出しまで済むので、モックを再起動しても注文は残る。Fastify がハンドラの前で返す 400（壊れた本文）も同じく切るか差し替える
+- **寿命**: 登録はメモリにだけあり、`PaperState` にも状態ファイルにも入らない（`GET /_control/state` にも出ない）。**`POST /_control/reset` で捨て、再起動で消える**。残り回数が 0 になった登録も、当たった回数（`hits`）を付けて一覧に残す（消えるのは reset と取消のときだけ）。`id` はプロセスの寿命のあいだ 1 から増え続け、reset でも振り直さない（reset の前に控えた `id` で、後の登録を取り消さないため）
+- **劣化中**（書き出しに失敗した後）: 登録・一覧・取消の 4 つは状態ファイルに書かないので通す。**故障は劣化の判定より先に当て、回数も減らす**。`rate_limit` / `server_error` は劣化中の `70001` より先に出る。`no_response` / `server_error_after_apply` は、劣化の判定が返した応答（状態を変える要求なら `70001`）を切るか差し替える（状態はもともと変わらない）
+- **control が無効なら**、口が無いだけでなく互換ルートにフックも掛けない。故障が起きる経路は無い
+- 当たった要求ごとに info のログを 1 行出す（`fault injected: <kind>`）。`no_response` はアクセスログに完了の行が出ないため
+
+- **根拠**: 本モック固有（計画書 18.2 の要判断事項 29〜34・36）。`rate_limit` の応答の形は実 API の実測（上の「レート制限」節）
+- **本物との差異**: bitbank API に存在しない口。本物の 429 は上限を超えたときに起きるが、モックは注入したときだけ返す（回数を数えるレート制限は無い。上の「レート制限」節）。**実 API の 5xx は測っていない**——どのステータスを返し得るか、本文が何か、処理の前に返るのか後に返るのか（前段の中継が時間切れで 5xx を返し、裏では処理が通っている、という形はあり得る）のどれも分からない。だから状態を変えない 5xx と変える 5xx の両方を用意し、形を揃えて応答からは区別できないようにした。本文を封筒にも JSON にも包まないのは推測で、利用側に「5xx の本文を JSON として読む」前提を持たせないため。429 の応答のヘッダ（`Retry-After` など）は実測の記録に無いので付けない。応答不明の切り方（応答を書かずにソケットを閉じる）もモックの決め事で、本物の切れ方（タイムアウトやリセット）を模していない
+- **推測**: はい
+  - 確認先 **実 API**: 実 API が 5xx を返すとき、本文は bitbank の封筒ですか、それ以外ですか
+  - 確認先 **実 API**: 実 API の 429 の応答には、`Retry-After` のような再試行の間隔を示すヘッダが付きますか
+  - 確認先 **モックの設計判断**: 5xx の本文を封筒にも JSON にも包まず、ステータスの理由句の素の文字列にし、状態を変える 5xx と変えない 5xx を同じ形にすること
+  - 確認先 **モックの設計判断**: 故障を回数で指定し、同じ（メソッド, パス）の登録を登録した順に使い切り、要求の中身に依らず当てること
+  - 確認先 **モックの設計判断**: 登録をメモリにだけ持って reset で捨て、劣化中も登録・一覧・取消を通し、故障を劣化の判定より先に当てること
+- **利用側への含意**: **5xx を「未実行」の印として扱わないこと**——`server_error_after_apply` のとおり、5xx でも状態が変わっていることがある。応答不明と同じく、発注を再送する前に REST の照合（`orders_info` / `active_orders`）と private stream で結果を確かめる（再送すると同じ注文を 2 回出し得る）。**5xx の本文を JSON として読む前に、HTTP ステータスで分岐する**（本文は封筒でも JSON でもない）。429 / `10009` は再試行の合図で、再試行の間隔はヘッダに頼らず利用側で決める。狙った要求に故障を当てたいテストは、その要求を直列に送る。シナリオの冒頭で reset すれば、前の実験で使い残した登録は持ち越さない
 
 ### 足の取得の健全性
 
