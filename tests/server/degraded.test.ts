@@ -122,6 +122,13 @@ describe("劣化モード（persist に失敗した後）", () => {
       url: "/_control/orders/1/fill",
       payload: {},
     },
+    // seededState() の注文 1 は UNFILLED なので、劣化していなければ REJECTED になる。
+    {
+      name: "POST /_control/orders/:order_id/reject",
+      method: "POST",
+      url: "/_control/orders/1/reject",
+      payload: {},
+    },
   ];
 
   it.each(MUTATING_REQUESTS)("劣化中は $name を断る", async ({ method, url, payload }) => {

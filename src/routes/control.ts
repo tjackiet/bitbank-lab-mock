@@ -4,7 +4,7 @@ import { type Candle, isValidCandle, isValidCandleTimestamp } from "../engine/ca
 import { runTick } from "../engine/match.ts";
 import { fitsDigits, precisionOf } from "../engine/precision.ts";
 import { freshState, isActive, pairAssets, remainingOf } from "../engine/state.ts";
-import { fillOrder } from "../engine/transitions.ts";
+import { fillOrder, rejectOrder } from "../engine/transitions.ts";
 import { formatOrder, formatTrade } from "./format.ts";
 import { asRecord } from "./params.ts";
 
@@ -359,6 +359,37 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
       order: formatOrder(r.data.order),
       trade: r.data.trade ? formatTrade(r.data.trade) : null,
     };
+  });
+
+  /**
+   * 注文を `REJECTED` にする（`rejectOrder()`）。`fill` と対になる口で、応答も `fill` の
+   * `order` と同じ形（`{ order }`。約定は起きないので `trade` は持たない）。本文は読まない。
+   *
+   * 受け付けるのは `UNFILLED` と `INACTIVE` だけで、どの状態を受けるかは `rejectOrder()` が
+   * 決める（ここで同じ集合を持ち直さない）。部分約定済みの注文を断るのは不変量 2
+   * （`REJECTED` の約定量は 0）のため。拘束は active な注文から計算するので、`REJECTED` に
+   * した時点で外れる。
+   *
+   * - 存在しない: 404 `ORDER_NOT_FOUND`
+   * - 受け付けない状態: 409 `ORDER_NOT_ACTIVE`（`status` を添える）
+   *
+   * private stream には、状態の差から `REJECTED` の `spot_order` と拘束が外れた資産の
+   * `asset_update` が流れる（公式の stream の status の列挙には `REJECTED` が無い。
+   * `docs/fidelity.md` の「private stream の注文ペイロード」節）。
+   */
+  fastify.post("/orders/:order_id/reject", async (request, reply) => {
+    const orderId = String((request.params as { order_id: string }).order_id);
+    const store = fastify.store;
+    const before = store.state();
+    const order = before.orders.find((o) => o.id === orderId);
+    if (!order) return reply.code(404).send({ error: "ORDER_NOT_FOUND" });
+
+    const r = rejectOrder(before, orderId, new Date().toISOString());
+    if (!r.success) {
+      return reply.code(409).send({ error: "ORDER_NOT_ACTIVE", status: order.status });
+    }
+    await store.commit(r.data.state);
+    return { order: formatOrder(r.data.order) };
   });
 
   /*
