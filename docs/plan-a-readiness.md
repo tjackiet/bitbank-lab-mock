@@ -67,7 +67,7 @@
 | 意図した約定を起こす手段 | 対応 | `POST /_control/orders/:order_id/fill` / `POST /_control/tick` | [`/_control/`](fidelity.md#_control) / [control の fill / tick 検証](fidelity.md#control-の-fill--tick-検証) / [control 時の自動約定](fidelity.md#control-時の自動約定) |
 | 残高と拘束額の確認 | 対応 | `GET /v1/user/assets` | [拘束額](fidelity.md#拘束額) / [残高の桁](fidelity.md#残高の桁) / [手数料](fidelity.md#手数料) / [assets に出る資産](fidelity.md#assets-に出る資産) |
 | 状態の再現性 | 対応 | `POST /_control/reset` と `BITBANK_MOCK_FILL_MODE=manual` | [control 時の自動約定](fidelity.md#control-時の自動約定) / [注文 ID](fidelity.md#注文-id) / [trade ID](fidelity.md#trade-id) |
-| 時計の操作 | **一部** | `POST /_control/clock` / `POST /_control/tick` | [control の時計](fidelity.md#control-の時計) |
+| 時計の操作 | **一部** | `BITBANK_MOCK_CLOCK=virtual` で起動し、`POST /_control/clock` / `POST /_control/tick` | [仮想時計](fidelity.md#仮想時計) / [control の時計](fidelity.md#control-の時計) |
 | 再起動をまたぐ永続化 | **一部** | 状態ファイル（`BITBANK_MOCK_STATE_PATH`） | [状態の永続化](fidelity.md#状態の永続化) / [壊れた状態ファイル](fidelity.md#壊れた状態ファイル) / [同一状態ファイルの多重起動](fidelity.md#同一状態ファイルの多重起動) |
 | 失敗の見え方（error code と封筒） | **一部** | 互換ルートは封筒、`/_control/` は素の JSON | [エラーコード](fidelity.md#エラーコード) / [封筒に包まれない応答](fidelity.md#封筒に包まれない応答) / [配列の包み方](fidelity.md#配列の包み方) |
 | 注文・約定・残高の変化の push 受信 | **一部** | `GET /_stream/private`（WebSocket）と `GET /v1/user/subscribe` | [private stream](fidelity.md#private-stream) / [private stream のメッセージ](fidelity.md#private-stream-のメッセージ) / [private stream の発火契機](fidelity.md#private-stream-の発火契機) |
@@ -76,7 +76,10 @@
 
 「**一部**」と書いたものは、対応してはいるが**範囲に条件が付く**もの。条件そのものは上の節で読む。
 
-- **時計の操作** — 動かせる範囲に上限がある。上限の値と、超えたときに返るもの、戻す手段は
+- **時計の操作** — 注文・約定・取消の時刻を動かせるのは**仮想時計で起動したときだけ**（control 有効かつ
+  manual モードに限る。既定の実時刻モードでは、互換ルートが記録する時刻は実時刻のまま）。仮想時計は自分では
+  進まず、1 回で進める幅と、戻せる範囲（既存の記録より前へは戻せない）に条件がある。成行の価格は実時刻の窓で取る。
+  条件は [`fidelity.md` の「仮想時計」](fidelity.md#仮想時計)、実時刻モードの上限と戻す手段は
   [`fidelity.md` の「control の時計」](fidelity.md#control-の時計)にある
 - **再起動をまたぐ永続化** — **成功応答は書き込みの成功を意味しない。** 何が保証され、何が保証されないかと、
   書き込みが効いているかの確かめ方は [`fidelity.md` の「状態の永続化」](fidelity.md#状態の永続化)にある

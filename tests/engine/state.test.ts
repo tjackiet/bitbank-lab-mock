@@ -9,12 +9,13 @@ import {
   computeLocked,
   DEFAULT_TAKER_FEE_RATE,
   genId,
+  latestRecordMs,
   nowIso,
   PaperStateSchema,
   pairAssets,
 } from "../../src/engine/state.ts";
 import { placeOrder } from "../../src/engine/transitions.ts";
-import { buildOrder, buildState } from "./helpers.ts";
+import { buildOrder, buildState, buildTrade } from "./helpers.ts";
 
 let dir: string;
 let statePath: string;
@@ -153,6 +154,75 @@ describe("pure helpers", () => {
     expect(pairAssets("foo_jpy")).toEqual(["foo", "jpy"]);
     expect(pairAssets("1inch_jpy")).toEqual(["1inch", "jpy"]);
     expect(pairAssets("abc123_xyz9")).toEqual(["abc123", "xyz9"]);
+  });
+});
+
+/**
+ * 「記録」の時刻の最大（`docs/plan-lab-mock.md` 17.2 の決定 28）。仮想時計の
+ * `POST /_control/clock` が、時計をこれより前へ置くのを断る。
+ */
+describe("latestRecordMs", () => {
+  const at = (s: string) => Date.parse(s);
+
+  it("記録が無ければ null", () => {
+    expect(latestRecordMs(buildState())).toBeNull();
+  });
+
+  it("orderedAt / canceledAt / trade の executedAt の最大を取る", () => {
+    const base = buildState({
+      orders: [
+        buildOrder({ id: "1", orderedAt: "2026-01-01T00:00:00.000Z" }),
+        buildOrder({ id: "2", orderedAt: "2026-01-01T00:00:01.000Z" }),
+      ],
+    });
+    expect(latestRecordMs(base)).toBe(at("2026-01-01T00:00:01.000Z"));
+
+    const canceled = buildState({
+      orders: [
+        buildOrder({
+          id: "1",
+          status: "CANCELED_UNFILLED",
+          orderedAt: "2026-01-01T00:00:00.000Z",
+          canceledAt: "2026-01-01T00:00:05.000Z",
+        }),
+      ],
+    });
+    expect(latestRecordMs(canceled)).toBe(at("2026-01-01T00:00:05.000Z"));
+
+    const traded = buildState({
+      orders: [buildOrder({ id: "1", orderedAt: "2026-01-01T00:00:00.000Z" })],
+      trades: [buildTrade({ orderId: "1", executedAt: "2026-01-01T00:00:09.000Z" })],
+    });
+    expect(latestRecordMs(traded)).toBe(at("2026-01-01T00:00:09.000Z"));
+  });
+
+  // 決定 28 は `updatedAt` と `lastTickAt` を記録に含めない。含めると、`/_control/clock` の
+  // `updatedAt`（実時刻）や時計そのものが下限になり、記録の無い区間へ戻せなくなる。
+  it("updatedAt と lastTickAt は数えない", () => {
+    const state = buildState({
+      updatedAt: "2030-01-01T00:00:00.000Z",
+      lastTickAt: "2030-01-01T00:00:00.000Z",
+      orders: [
+        buildOrder({
+          id: "1",
+          orderedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2030-01-01T00:00:00.000Z",
+        }),
+      ],
+    });
+    expect(latestRecordMs(state)).toBe(at("2026-01-01T00:00:00.000Z"));
+  });
+
+  it("日付として解釈できない記録は飛ばす", () => {
+    const state = buildState({
+      orders: [
+        buildOrder({ id: "1", orderedAt: "not-a-date" }),
+        buildOrder({ id: "2", orderedAt: "2026-01-01T00:00:00.000Z" }),
+      ],
+      trades: [buildTrade({ orderId: "2", executedAt: "also-not-a-date" })],
+    });
+    expect(latestRecordMs(state)).toBe(at("2026-01-01T00:00:00.000Z"));
+    expect(latestRecordMs(buildState({ orders: [buildOrder({ orderedAt: "x" })] }))).toBeNull();
   });
 });
 

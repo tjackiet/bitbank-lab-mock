@@ -128,19 +128,23 @@ const reads = routeFiles.flatMap((f) =>
 /**
  * **`src/routes/` で実時刻を直に読んでよい箇所と、その理由。** 鍵は `ファイル ルート 変数名`。
  *
- * 2 つとも `/_control/` の時計の上限の判定で、上限は「実時刻から 24 時間」と決めてある
+ * 2 つとも `/_control/` の時計の規則で、実時刻モードの上限は「実時刻から 24 時間」と決めてある
  * （`src/routes/control.ts` の `MAX_CLOCK_AHEAD_MS`）。記録する時刻の出どころ
- * （`store.now()`）とは別の基準なので、時計そのものからは測らない。
+ * （`store.now()`）とは別の基準なので、時計そのものからは測らない。仮想時計
+ * （`BITBANK_MOCK_CLOCK=virtual`）では上限の基準が `store.now()` に替わるが、clock の
+ * `updatedAt` はどちらのモードでも実時刻のまま（`docs/fidelity.md` の「仮想時計」節）。
  *
  * 許可リストは緩めるためではなく、例外を 1 か所に集めて古くならせないために持つ。
  * 載せた箇所が無くなればエントリを外すまで落ちる（`tests/structure.test.ts` と同じ考え方）。
  */
 const ALLOWED_REAL_CLOCK_READS: Record<string, string> = {
   "control.ts POST /tick realNowMs":
-    "`POST /_control/tick` の上限（実時刻 + `MAX_CLOCK_AHEAD_MS`）の基準。60 秒の前進と" +
-    "足の `timestamp` の両方をこの上限と比べる",
+    "実時刻モードの `POST /_control/tick` の上限（実時刻 + `MAX_CLOCK_AHEAD_MS`）と、tick の" +
+    "前進の下限（`max(実時刻, lastTickAt + 60 秒)`）の基準。60 秒の前進と足の `timestamp` の" +
+    "両方をこの上限と比べる。仮想時計では読まない",
   "control.ts POST /clock realNowMs":
-    "`POST /_control/clock` の上限（実時刻 + `MAX_CLOCK_AHEAD_MS`）の基準",
+    "実時刻モードの `POST /_control/clock` の上限（実時刻 + `MAX_CLOCK_AHEAD_MS`）の基準と、" +
+    "本文を省いたときの行き先。`updatedAt` は両モードともこの値で書く",
 };
 
 describe("src/routes/ は時刻を store.now() から読む（静的）", () => {

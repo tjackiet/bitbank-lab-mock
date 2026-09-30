@@ -3,7 +3,7 @@ import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { type Candle, isValidCandle, isValidCandleTimestamp } from "../engine/candles.ts";
 import { runTick } from "../engine/match.ts";
 import { fitsDigits, precisionOf } from "../engine/precision.ts";
-import { freshState, isActive, pairAssets, remainingOf } from "../engine/state.ts";
+import { freshState, isActive, latestRecordMs, pairAssets, remainingOf } from "../engine/state.ts";
 import { fillOrder, rejectOrder } from "../engine/transitions.ts";
 import { formatOrder, formatTrade } from "./format.ts";
 import { asRecord } from "./params.ts";
@@ -71,23 +71,92 @@ function tokenMatches(given: string, expected: string): boolean {
 const ASSET_KEY_RE = /^[a-z0-9]+$/;
 
 /**
- * `/_control/` の時計（`lastTickAt`）に許す、実時刻からの先行幅。
+ * `/_control/` の時計（`lastTickAt`）を 1 度に動かせる幅。**基準は時計のモードで変わる。**
  *
- * `POST /_control/tick` が `lastTickAt` を進める経路は 2 つあり、どちらもこの幅で止める。
- * 片方だけ塞いでももう片方から進むので、両方に効かせる。
+ * **実時刻モード（既定）: 実時刻からの先行幅。** `POST /_control/tick` が `lastTickAt` を進める
+ * 経路は 2 つあり、どちらもこの幅で止める。片方だけ塞いでももう片方から進むので、両方に効かせる。
  *
  * - 利用者が渡す足の `timestamp`（1 桁の打ち間違いがそのまま時計になる）
  * - tick ごとの 60 秒の単調前進（1 回ずつは小さいが、繰り返すと際限が無い）
+ *
+ * **仮想時計（`BITBANK_MOCK_CLOCK=virtual`）: 1 回の要求で進める幅。** 「実時刻から」の上限を外し、
+ * いまの仮想時刻からこの幅までにする（`docs/plan-lab-mock.md` 17.2 の決定 27）。繰り返せば
+ * 何日でも先へ進めるのは意図した操作なので止めない。打ち間違いは今と同じく 1 回の要求で断れる。
  *
  * 24 時間にしたのは、`runTick` が 1 回の tick で遡る上限（`MAX_LOOKBACK_MS`）と同じ幅で、
  * 1 分足なら 1 日分（1440 本）にあたるため。合成の tick を 1440 回重ねるまでは今までどおり
  * 通り、`4e12`（西暦 2096）のような打ち間違いはこの幅で落ちる。
  *
  * これは #20 / #21 で入れた足の `timestamp` の上限（`Date` の表現範囲 − JST オフセット、
- * `isValidCandleTimestamp`）とは別の、その内側にある制約。`/_control/` の中だけで持ち、
- * 互換ルート（`/v1/user/...`）の時刻には一切効かせない。
+ * `isValidCandleTimestamp`）とは別の、その内側にある制約（仮想時計でもそちらはそのまま効く）。
+ * `/_control/` の中だけで持ち、互換ルート（`/v1/user/...`）の時刻には一切効かせない。
  */
 const MAX_CLOCK_AHEAD_MS = 24 * 60 * 60 * 1000;
+
+/** 足の長さ（1 分足）。約定時刻は足の `timestamp` + これ（`applyFill`）。 */
+const CANDLE_MS = 60_000;
+
+/**
+ * `POST /_control/tick` が受ける足の `timestamp` の範囲と、tick の後の時計。時計のモードで変わる
+ * ので、モードごとに組み立てて（`realTickBounds()` / `virtualTickBounds()`）ハンドラは 1 本にする。
+ */
+type TickBounds = {
+  /** 足の `timestamp` を省いたとき（`{ price }` の合成の足を含む）に使う値。 */
+  defaultTimestamp: number;
+  /** 受ける `timestamp` の下限（含む）。下限が無ければ `null`。 */
+  minTimestamp: number | null;
+  /** 受ける `timestamp` の上限（含む）。 */
+  maxTimestamp: number;
+  /** tick の後の時計（`runTick` の `nowMs`）を、足の `timestamp` から決める。 */
+  clockAfter: (timestamp: number) => number;
+};
+
+/**
+ * 実時刻モードの tick の範囲。**仮想時計を足す前の挙動のまま**で、仮想時計のために変えていない。
+ *
+ * 1 分足が同じ実時刻の 2 本でも別の窓に落ちるよう、tick ごとに最低 60 秒進める
+ * （`max(realNowMs, lastTickAt + 60 秒)`）。その 60 秒だけで上限を越えるなら（＝時計が上限の
+ * 60 秒手前まで来ているなら）、進めずに断る（`null`）。ここで黙ってクランプすると 60 秒の前進が
+ * 崩れて、同じ実時刻の 2 本が同じ窓・同じ約定時刻に落ちる。断られた側は `POST /_control/clock` で
+ * 時計だけ戻せる（注文・約定・残高は残る）。
+ *
+ * 過去の足はそのまま通す（過去の足を流し直す用途）。止めるのは先の側だけ。約定時刻は
+ * `timestamp + 1 分` なので、**時計（`max(前進の下限, timestamp)`）より最大 1 分先に記録される**
+ * （`docs/fidelity.md` の「control の時計」節）。
+ */
+function realTickBounds(lastMs: number, realNowMs: number): TickBounds | null {
+  const maxMs = realNowMs + MAX_CLOCK_AHEAD_MS;
+  const nowMs = Math.max(realNowMs, lastMs + CANDLE_MS);
+  if (nowMs > maxMs) return null;
+  return {
+    defaultTimestamp: nowMs,
+    minTimestamp: null,
+    maxTimestamp: maxMs,
+    clockAfter: (timestamp) => Math.max(nowMs, timestamp),
+  };
+}
+
+/**
+ * 仮想時計の tick の範囲。**「いまの時刻から始まる 1 分足が閉じて、その終わりに約定し、時計も
+ * そこへ進む」**形にする（`docs/fidelity.md` の「仮想時計」節）。
+ *
+ * - 足の既定の `timestamp` はいまの仮想時刻。いまの時刻に出した注文（`ordered_at` が同じ値）にも
+ *   当たる（`runTick` は `orderedAt <= timestamp` の注文を見る）
+ * - tick の後の時計は `timestamp + 1 分`（`max(いまの時刻, timestamp + 1 分)` と同じ。下限が
+ *   いまの時刻なので）。約定時刻（`applyFill` の `timestamp + 1 分`）と一致するので、
+ *   **約定が時計より先に残らない**。実時刻モードと同じく 1 回で必ず 60 秒以上進む
+ * - いまの時刻より前の足は断る。約定時刻が既存の記録より前になり得るため
+ *   （`POST /_control/clock` の巻き戻しの下限と揃える。17.2 の決定 28）
+ * - 上限は tick の後の時計がいまの時刻 + 24 時間を越えないところ（決定 27）
+ */
+function virtualTickBounds(virtualNowMs: number): TickBounds {
+  return {
+    defaultTimestamp: virtualNowMs,
+    minTimestamp: virtualNowMs,
+    maxTimestamp: virtualNowMs + MAX_CLOCK_AHEAD_MS - CANDLE_MS,
+    clockAfter: (timestamp) => timestamp + CANDLE_MS,
+  };
+}
 
 function syntheticCandle(price: number, timestamp: number): Candle {
   return { open: price, high: price, low: price, close: price, vol: 0, timestamp };
@@ -147,11 +216,17 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
    * メッセージは JSON の値として載せるだけで、ログのように包み直しはしない。応答自体が
    * JSON なので、シリアライザが改行も制御文字も逃がす（ログで包むのは、行指向の出力では
    * 改行が行を割るからで、`persist.lastError.message` も同じ扱い）。
+   *
+   * 仮想時計（`BITBANK_MOCK_CLOCK=virtual`）のときは `clock: { mode: "virtual" }` も添える。
+   * 仮想時計が効いているかを応答だけで確かめるため（`candles.fillMode` と同じ考え方）。
+   * いまの仮想時刻は `lastTickAt` そのもの。
    */
   fastify.get("/state", async () => ({
     ...fastify.store.state(),
     persist: fastify.store.persistHealth(),
     candles: fastify.store.candlesHealth(),
+    // 仮想時計のときだけ添える。実時刻モード（既定）の応答の形は変えない（無いことが実時刻の印）。
+    ...(fastify.store.clockMode === "virtual" ? { clock: { mode: "virtual" } } : {}),
   }));
 
   /**
@@ -210,26 +285,24 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
       return reply.code(400).send({ error: "INVALID_PAIR" });
     }
     const store = fastify.store;
-    const lastMs = Date.parse(store.state().lastTickAt);
-    // ここは `store.now()` ではなく実時刻を読む。上限（下の `maxMs`）は「実時刻から 24 時間」と
-    // 決めてあり（`MAX_CLOCK_AHEAD_MS`）、記録する時刻の出どころ（`store.now()`）とは別の基準
-    // だから。`src/routes/` で `Date.now()` を直に呼んでよいのは、ここと `POST /clock` の
-    // 2 か所だけ（`tests/routes/time-source.test.ts`）。
-    const realNowMs = Date.now();
-    // 時計に許す上限。以降の 2 つの検査はどちらもこの値と比べる。
-    const maxMs = realNowMs + MAX_CLOCK_AHEAD_MS;
-    // 1 分足が同じ実時刻の 2 本でも別の窓に落ちるよう、tick ごとに最低 60 秒進める。
-    const nowMs = Math.max(realNowMs, lastMs + 60_000);
-    // その 60 秒だけで上限を越えるなら（＝時計が上限の 60 秒手前まで来ているなら）、
-    // 進めずに断る。ここで黙ってクランプすると 60 秒の前進が崩れて、同じ実時刻の
-    // 2 本が同じ窓・同じ約定時刻に落ちる。断られた側は POST /_control/clock で
-    // 時計だけ戻せる（注文・約定・残高は残る）。
-    if (nowMs > maxMs) {
-      return reply.code(400).send({
-        error: "CLOCK_TOO_FAR_AHEAD",
-        lastTickAt: store.state().lastTickAt,
-        maxLastTickAt: new Date(maxMs).toISOString(),
-      });
+    let bounds: TickBounds;
+    if (store.clockMode === "virtual") {
+      bounds = virtualTickBounds(store.now());
+    } else {
+      // ここは `store.now()` ではなく実時刻を読む。実時刻モードの上限は「実時刻から 24 時間」と
+      // 決めてあり（`MAX_CLOCK_AHEAD_MS`）、記録する時刻の出どころ（`store.now()`）とは別の基準
+      // だから。`src/routes/` で `Date.now()` を直に呼んでよいのは、ここと `POST /clock` の
+      // 2 か所だけ（`tests/routes/time-source.test.ts`）。
+      const realNowMs = Date.now();
+      const real = realTickBounds(Date.parse(store.state().lastTickAt), realNowMs);
+      if (real === null) {
+        return reply.code(400).send({
+          error: "CLOCK_TOO_FAR_AHEAD",
+          lastTickAt: store.state().lastTickAt,
+          maxLastTickAt: new Date(realNowMs + MAX_CLOCK_AHEAD_MS).toISOString(),
+        });
+      }
+      bounds = real;
     }
     let candle: Candle;
     if (body.candle !== undefined) {
@@ -241,26 +314,32 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
         low: Number(raw.low),
         close: Number(raw.close),
         vol: Number(raw.vol ?? 0),
-        timestamp: raw.timestamp === undefined ? nowMs : Number(raw.timestamp),
+        timestamp: raw.timestamp === undefined ? bounds.defaultTimestamp : Number(raw.timestamp),
       };
     } else if (body.price !== undefined) {
       const price = Number(body.price);
-      candle = syntheticCandle(price, nowMs);
+      candle = syntheticCandle(price, bounds.defaultTimestamp);
     } else {
       return reply.code(400).send({ error: "INVALID_CANDLE" });
     }
     if (!isValidCandle(candle)) return reply.code(400).send({ error: "INVALID_CANDLE" });
-    // 過去の足はそのまま通す（過去の足を流し直す用途）。止めるのは先の側だけ。
-    // ここでクランプせず断るのは、足の timestamp を黙って書き換えると約定時刻
+    // 範囲の外はクランプせず断る。足の timestamp を黙って書き換えると約定時刻
     // （applyFill の candle.timestamp + 1 分）が渡した値とずれるため。断れば状態は
     // 変わらないので、打ち間違えても組み立てたシナリオは残る。
-    if (candle.timestamp > maxMs) {
-      return reply.code(400).send({ error: "CANDLE_TOO_FAR_AHEAD", maxTimestamp: maxMs });
+    if (bounds.minTimestamp !== null && candle.timestamp < bounds.minTimestamp) {
+      return reply
+        .code(400)
+        .send({ error: "CANDLE_BEFORE_CLOCK", minTimestamp: bounds.minTimestamp });
+    }
+    if (candle.timestamp > bounds.maxTimestamp) {
+      return reply
+        .code(400)
+        .send({ error: "CANDLE_TOO_FAR_AHEAD", maxTimestamp: bounds.maxTimestamp });
     }
 
     const r = runTick(store.state(), {
       candles: [candle],
-      nowMs: Math.max(nowMs, candle.timestamp),
+      nowMs: bounds.clockAfter(candle.timestamp),
       pair: body.pair,
       feeRate: store.feeRate,
     });
@@ -272,14 +351,30 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
   /**
    * 時計（`lastTickAt`）だけを動かす。`POST /_control/reset` と違って注文・約定・残高は
    * そのまま残すので、`MAX_CLOCK_AHEAD_MS` に当たった tick や、先へ行き過ぎた時計の
-   * 後始末を、組み立てたシナリオを捨てずに行える。
+   * 後始末を、組み立てたシナリオを捨てずに行える。仮想時計では、これが時計を進める口になる。
    *
-   * 本文を省略するか `{}` なら現在時刻へ戻す。`lastTickAt` を渡すときは ISO 文字列か
-   * エポックミリ秒で、足の `timestamp` と同じ範囲（`isValidCandleTimestamp`）かつ
-   * 現在時刻 + `MAX_CLOCK_AHEAD_MS` 以内であること。外れたら 400 で状態は変えない。
-   * 戻す向きにも進める向きにも使える（過去の足を流し直す前に時計を戻す用途がある）。
+   * 本文は次のどれか。外れたら 400 で状態は変えない。
    *
-   * `updatedAt` は実時刻で更新する。時計を戻しても「状態を最後に変えた時刻」は戻らない。
+   * - 省略か `{}`: 現在時刻へ戻す。**仮想時計では断る**（400 `CLOCK_TARGET_REQUIRED`）——
+   *   「現在時刻」に意味が無く、黙って実時刻へ飛ぶと以後の記録が実時刻になるため
+   * - `{ lastTickAt }`: その時刻へ動かす。ISO 文字列かエポックミリ秒で、足の `timestamp` と
+   *   同じ範囲（`isValidCandleTimestamp`）
+   * - `{ advanceMs }`: いまの `lastTickAt` から N ミリ秒進める。正の整数で、進めた先は上と
+   *   同じ範囲。**1 回で進める幅は `MAX_CLOCK_AHEAD_MS` まで**（どちらのモードでも）
+   *
+   * 両方を渡したら 400 `INVALID_CLOCK`（どちらを採るか決められない）。
+   *
+   * 上限（400 `CLOCK_TOO_FAR_AHEAD`）と下限は時計のモードで変わる。
+   *
+   * - 実時刻モード: 上限は現在時刻 + `MAX_CLOCK_AHEAD_MS`（`advanceMs` ではさらに
+   *   いまの `lastTickAt` + `MAX_CLOCK_AHEAD_MS`）。下限は無く、戻す向きにも使える
+   *   （過去の足を流し直す前に時計を戻す用途がある）
+   * - 仮想時計: 上限はいまの仮想時刻 + `MAX_CLOCK_AHEAD_MS`（17.2 の決定 27）。**既存の記録
+   *   （`latestRecordMs()`）より前へは置けない**（400 `CLOCK_BEFORE_RECORDS`。決定 28）。
+   *   記録より後であれば戻せる。記録より前へ戻したいときは reset する
+   *
+   * `updatedAt` はどちらのモードでも実時刻で更新する。時計を戻しても「状態を最後に変えた時刻」は
+   * 戻らない。
    */
   fastify.post("/clock", async (request, reply) => {
     // 本文を省略したときだけ `{}`（＝現在時刻へ戻す）と見なす。`asRecord()` は配列・
@@ -287,18 +382,41 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
     // 「本文なし」と同じ扱いになり、黙って時計が動いてしまう。
     const body = request.body === undefined ? {} : asRecord(request.body);
     if (!body) return reply.code(400).send({ error: "INVALID_CLOCK" });
+    if (body.lastTickAt !== undefined && body.advanceMs !== undefined) {
+      return reply.code(400).send({ error: "INVALID_CLOCK" });
+    }
+    const store = fastify.store;
+    const virtual = store.clockMode === "virtual";
     // ここは `store.now()` ではなく実時刻を読む。理由は `POST /tick` の `realNowMs` と同じで、
-    // 上限（`MAX_CLOCK_AHEAD_MS`）は「実時刻から 24 時間」と決めてあるため。
+    // 実時刻モードの上限（`MAX_CLOCK_AHEAD_MS`）は「実時刻から 24 時間」と決めてあるため。
+    // 本文を省いたときの行き先と、`updatedAt`（両モード）にも使う。
     const realNowMs = Date.now();
-    let ms = realNowMs;
-    if (body.lastTickAt !== undefined) {
+    const previousLastTickAt = store.state().lastTickAt;
+    const lastMs = Date.parse(previousLastTickAt);
+    let ms: number;
+    // 上限。本文を省いたとき（実時刻モードで現在時刻へ戻す）は見ない。
+    let maxMs: number | null = null;
+    if (body.advanceMs !== undefined) {
+      const advanceMs = body.advanceMs;
+      if (typeof advanceMs !== "number" || !Number.isSafeInteger(advanceMs) || advanceMs <= 0) {
+        return reply.code(400).send({ error: "INVALID_CLOCK" });
+      }
+      ms = lastMs + advanceMs;
+      maxMs = (virtual ? lastMs : Math.min(realNowMs, lastMs)) + MAX_CLOCK_AHEAD_MS;
+    } else if (body.lastTickAt !== undefined) {
       const raw = body.lastTickAt;
       if (typeof raw === "number") ms = raw;
       else if (typeof raw === "string") ms = Date.parse(raw);
       else return reply.code(400).send({ error: "INVALID_CLOCK" });
-      // Date.parse は解釈できない文字列で NaN を返す。isValidCandleTimestamp が弾く。
+      maxMs = (virtual ? lastMs : realNowMs) + MAX_CLOCK_AHEAD_MS;
+    } else {
+      if (virtual) return reply.code(400).send({ error: "CLOCK_TARGET_REQUIRED" });
+      ms = realNowMs;
+    }
+    if (maxMs !== null) {
+      // Date.parse は解釈できない文字列で NaN を返す。isValidCandleTimestamp が弾く
+      // （状態ファイルの lastTickAt が解釈できないときの advanceMs もここで落ちる）。
       if (!isValidCandleTimestamp(ms)) return reply.code(400).send({ error: "INVALID_CLOCK" });
-      const maxMs = realNowMs + MAX_CLOCK_AHEAD_MS;
       if (ms > maxMs) {
         return reply.code(400).send({
           error: "CLOCK_TOO_FAR_AHEAD",
@@ -306,8 +424,15 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
         });
       }
     }
-    const store = fastify.store;
-    const previousLastTickAt = store.state().lastTickAt;
+    if (virtual) {
+      const floorMs = latestRecordMs(store.state());
+      if (floorMs !== null && ms < floorMs) {
+        return reply.code(400).send({
+          error: "CLOCK_BEFORE_RECORDS",
+          minLastTickAt: new Date(floorMs).toISOString(),
+        });
+      }
+    }
     const lastTickAt = new Date(Math.trunc(ms)).toISOString();
     await store.commit({
       ...store.state(),

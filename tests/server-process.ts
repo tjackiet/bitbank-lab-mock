@@ -1,9 +1,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { request } from "node:http";
 import { createServer } from "node:net";
 
 /**
  * 実プロセスとしてサーバを起こすための道具。`inject()` では見えないもの——起動引数、
- * 状態ファイルの排他、実際に listen したポート、curl から叩ける口——を見るテストが使う。
+ * 状態ファイルの排他、実際に listen したポート、curl から叩ける口、再起動をまたぐ状態——を
+ * 見るテストが使う。
  *
  * `tests/index.test.ts`（配線）と `tests/scenarios/example-script.test.ts`（例のスクリプト）の
  * 2 箇所から使う。写すと、下の `--import` の理由のような**外すと壊れる注意書き**が
@@ -86,4 +88,41 @@ export function waitUntilListening(child: ChildProcess): Promise<string> {
 export function waitForExit(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   return new Promise((resolve) => child.once("exit", () => resolve()));
+}
+
+/**
+ * 起こしたサーバへ JSON の要求を 1 本送り、ステータスと本文を返す。
+ *
+ * **`fetch` ではなく `node:http` で話す。** テストからの `fetch` は宛先を問わず番人が止める
+ * （`tests/network-guard.ts`。ローカルへ話すなら子プロセスか `node:http`、と同ファイルが書く）。
+ * 宛先は `127.0.0.1` に固定する——プロキシの設定を読まないので、外へ回ることもない。
+ */
+export function requestJson(
+  port: number,
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown,
+): Promise<{ status: number; body: unknown }> {
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = request(
+      {
+        host: "127.0.0.1",
+        port,
+        method,
+        path,
+        headers: payload === undefined ? {} : { "content-type": "application/json" },
+      },
+      (res) => {
+        let text = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => {
+          text += chunk;
+        });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(text) }));
+      },
+    );
+    req.once("error", reject);
+    req.end(payload);
+  });
 }

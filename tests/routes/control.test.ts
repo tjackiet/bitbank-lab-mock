@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadState } from "../../src/engine/persist.ts";
 import { activeOrders, type OrderRecord, type OrderStatus } from "../../src/engine/state.ts";
 import { controlRoutes, controlTokenHeader } from "../../src/routes/control.ts";
+import type { ClockMode } from "../../src/server/config.ts";
 import { buildServer } from "../../src/server/http.ts";
 import { SessionStore } from "../../src/store/session.ts";
 import type { PrivateStreamMessage } from "../../src/stream/events.ts";
@@ -20,9 +21,18 @@ async function buildControl(
     balances: { jpy: 10_000_000 },
     orders: [buildOrder({ id: "1", price: 5_000_000, startAmount: 0.001 })],
   }),
-  opts: { token?: string; controlEnabled?: boolean; streamHoldLimit?: number } = {},
+  opts: {
+    token?: string;
+    controlEnabled?: boolean;
+    streamHoldLimit?: number;
+    clockMode?: ClockMode;
+  } = {},
 ) {
-  const store = new SessionStore(state, { path: null, fillMode: "manual" });
+  const store = new SessionStore(state, {
+    path: null,
+    fillMode: "manual",
+    clockMode: opts.clockMode,
+  });
   const fastify = await buildServer({
     store,
     logger: false,
@@ -1323,5 +1333,415 @@ describe("runTick が約定を適用できないとき", () => {
     expect(assets.statusCode).toBe(200);
     expect(assets.json()).toMatchObject({ success: 1 });
     await fastify.close();
+  });
+});
+
+/**
+ * `POST /_control/clock` の `{ advanceMs }`（いまの `lastTickAt` から N ミリ秒進める）。
+ * 仮想時計のために足した指定だが、実時刻モードでも受ける（`docs/fidelity.md` の「control の時計」節）。
+ * 上限はそのモードの規則（実時刻 + 24 時間）に、「1 回で 24 時間まで」を重ねたもの。
+ */
+describe("POST /_control/clock の advanceMs（実時刻モード）", () => {
+  const FIXED = Date.parse("2026-06-01T00:00:00.000Z");
+  const HOUR = 60 * 60 * 1000;
+  const iso = (ms: number) => new Date(ms).toISOString();
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(FIXED);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function advance(lastTickAtMs: number, advanceMs: unknown) {
+    const { fastify, store } = await buildControl(buildState({ lastTickAt: iso(lastTickAtMs) }));
+    const before = JSON.stringify(store.state());
+    const res = await fastify.inject({
+      method: "POST",
+      url: "/_control/clock",
+      payload: { advanceMs },
+    });
+    await fastify.close();
+    return { res, store, before };
+  }
+
+  it("いまの lastTickAt から進め、updatedAt は実時刻", async () => {
+    const { res, store } = await advance(FIXED - HOUR, 1_234);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      lastTickAt: iso(FIXED - HOUR + 1_234),
+      previousLastTickAt: iso(FIXED - HOUR),
+    });
+    expect(store.state().lastTickAt).toBe(iso(FIXED - HOUR + 1_234));
+    expect(store.state().updatedAt).toBe(iso(FIXED));
+  });
+
+  it("1 回で 24 時間まで。時計が過去にあっても 24 時間を超えては進めない", async () => {
+    const from = FIXED - 72 * HOUR;
+    const exact = await advance(from, MAX_CLOCK_AHEAD_MS);
+    expect(exact.res.statusCode).toBe(200);
+    expect(exact.store.state().lastTickAt).toBe(iso(from + MAX_CLOCK_AHEAD_MS));
+
+    const over = await advance(from, MAX_CLOCK_AHEAD_MS + 1);
+    expect(over.res.statusCode).toBe(400);
+    expect(over.res.json()).toEqual({
+      error: "CLOCK_TOO_FAR_AHEAD",
+      maxLastTickAt: iso(from + MAX_CLOCK_AHEAD_MS),
+    });
+    expect(JSON.stringify(over.store.state())).toBe(over.before);
+  });
+
+  it("時計が実時刻より先にあるときは、実時刻 + 24 時間が上限のまま", async () => {
+    const from = FIXED + HOUR;
+    const exact = await advance(from, MAX_CLOCK_AHEAD_MS - HOUR);
+    expect(exact.res.statusCode).toBe(200);
+    expect(exact.store.state().lastTickAt).toBe(iso(FIXED + MAX_CLOCK_AHEAD_MS));
+
+    const over = await advance(from, MAX_CLOCK_AHEAD_MS - HOUR + 1);
+    expect(over.res.statusCode).toBe(400);
+    expect(over.res.json()).toEqual({
+      error: "CLOCK_TOO_FAR_AHEAD",
+      maxLastTickAt: iso(FIXED + MAX_CLOCK_AHEAD_MS),
+    });
+    expect(JSON.stringify(over.store.state())).toBe(over.before);
+  });
+
+  it.each([[0], [-1], [1.5], ["1000"], [null], [Number.MAX_SAFE_INTEGER + 1], [true]])(
+    "正の整数でない advanceMs は 400 INVALID_CLOCK で、状態を変えない: %s",
+    async (advanceMs) => {
+      const { res, store, before } = await advance(FIXED, advanceMs);
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({ error: "INVALID_CLOCK" });
+      expect(JSON.stringify(store.state())).toBe(before);
+    },
+  );
+
+  it("lastTickAt と advanceMs を両方渡すと 400 INVALID_CLOCK", async () => {
+    const { fastify, store } = await buildControl(buildState());
+    const before = JSON.stringify(store.state());
+    const res = await fastify.inject({
+      method: "POST",
+      url: "/_control/clock",
+      payload: { lastTickAt: FIXED, advanceMs: 1 },
+    });
+    await fastify.close();
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: "INVALID_CLOCK" });
+    expect(JSON.stringify(store.state())).toBe(before);
+  });
+
+  // 状態ファイル由来の lastTickAt が解釈できないと、進める起点が無い。500 にせず 400 で断る。
+  it("lastTickAt が解釈できない状態では 400 INVALID_CLOCK", async () => {
+    const { fastify, store } = await buildControl(buildState({ lastTickAt: "not-a-date" }));
+    const res = await fastify.inject({
+      method: "POST",
+      url: "/_control/clock",
+      payload: { advanceMs: 1 },
+    });
+    await fastify.close();
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: "INVALID_CLOCK" });
+    expect(store.state().lastTickAt).toBe("not-a-date");
+  });
+});
+
+/**
+ * 仮想時計（`BITBANK_MOCK_CLOCK=virtual`）での `/_control/` の時計の規則
+ * （`docs/plan-lab-mock.md` 17.2 の決定 25〜28 と `docs/fidelity.md` の「仮想時計」節）。
+ *
+ * 時計は `lastTickAt` そのもので、`/_control/clock` と `/_control/tick` でしか動かない。
+ * **実時刻から十分に離した時刻（2020 年）から始める**——実時刻の上限や実時刻の記録が混ざれば、
+ * 必ず食い違って落ちる。
+ */
+describe("仮想時計の /_control/", () => {
+  const V0 = Date.parse("2020-02-03T04:05:06.789Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const cleanups: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    for (const fn of cleanups.splice(0)) await fn();
+  });
+
+  async function setup(overrides: Parameters<typeof buildState>[0] = {}) {
+    const r = await buildControl(
+      buildState({
+        lastTickAt: iso(V0),
+        orders: [],
+        ...overrides,
+      }),
+      { clockMode: "virtual" },
+    );
+    cleanups.push(async () => {
+      await r.fastify.close();
+    });
+    const clock = (payload?: unknown) =>
+      r.fastify.inject({ method: "POST", url: "/_control/clock", payload: payload as object });
+    const tick = (payload: unknown) =>
+      r.fastify.inject({ method: "POST", url: "/_control/tick", payload: payload as object });
+    return { ...r, clock, tick };
+  }
+
+  it("GET /_control/state に clock.mode を添える（実時刻モードには付けない）", async () => {
+    const { fastify, store } = await setup();
+    const res = await fastify.inject({ method: "GET", url: "/_control/state" });
+    expect(res.json()).toEqual({
+      ...store.state(),
+      persist: store.persistHealth(),
+      candles: store.candlesHealth(),
+      clock: { mode: "virtual" },
+    });
+    const { fastify: real } = await buildControl(buildState());
+    cleanups.push(async () => {
+      await real.close();
+    });
+    expect(
+      (await real.inject({ method: "GET", url: "/_control/state" })).json(),
+    ).not.toHaveProperty("clock");
+  });
+
+  it("advanceMs はいまの仮想時刻からミリ秒単位で進め、updatedAt だけは実時刻", async () => {
+    const { clock, store } = await setup();
+    const before = Date.now();
+    const res = await clock({ advanceMs: 1 });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ lastTickAt: iso(V0 + 1), previousLastTickAt: iso(V0) });
+    expect(store.now()).toBe(V0 + 1);
+    expect(Date.parse(store.state().updatedAt)).toBeGreaterThanOrEqual(before);
+  });
+
+  // 「現在時刻へ戻す」は仮想時計では意味が無い。黙って実時刻へ飛ぶと以後の記録が実時刻になる。
+  it.each([[undefined], [{}]])(
+    "本文の省略と {} は 400 CLOCK_TARGET_REQUIRED で、状態を変えない: %s",
+    async (payload) => {
+      const { clock, store } = await setup();
+      const before = JSON.stringify(store.state());
+      const res = await clock(payload);
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({ error: "CLOCK_TARGET_REQUIRED" });
+      expect(JSON.stringify(store.state())).toBe(before);
+    },
+  );
+
+  // 決定 27: 実時刻から 24 時間の上限は外し、1 回で進める幅を 24 時間までにする。
+  it("1 回に 24 時間を超えて進める指定は断り、24 時間ずつ 2 回なら 48 時間先まで進む", async () => {
+    const { clock, store } = await setup();
+    const tooFar = await clock({ advanceMs: MAX_CLOCK_AHEAD_MS + 1 });
+    expect(tooFar.statusCode).toBe(400);
+    expect(tooFar.json()).toEqual({
+      error: "CLOCK_TOO_FAR_AHEAD",
+      maxLastTickAt: iso(V0 + MAX_CLOCK_AHEAD_MS),
+    });
+    const tooFarAbsolute = await clock({ lastTickAt: V0 + MAX_CLOCK_AHEAD_MS + 1 });
+    expect(tooFarAbsolute.statusCode).toBe(400);
+    expect(tooFarAbsolute.json()).toMatchObject({ error: "CLOCK_TOO_FAR_AHEAD" });
+    expect(store.now()).toBe(V0);
+
+    expect((await clock({ advanceMs: MAX_CLOCK_AHEAD_MS })).statusCode).toBe(200);
+    expect((await clock({ lastTickAt: iso(V0 + 2 * MAX_CLOCK_AHEAD_MS) })).statusCode).toBe(200);
+    expect(store.now()).toBe(V0 + 2 * MAX_CLOCK_AHEAD_MS);
+  });
+
+  // 実時刻より 24 時間以上先へも進める（実時刻の上限が効いていない）。
+  it("実時刻 + 24 時間より先へ進められ、その先でも tick が通る", async () => {
+    const future = Date.now() + 3 * MAX_CLOCK_AHEAD_MS;
+    const { clock, tick, store } = await setup({ lastTickAt: iso(future) });
+    expect((await clock({ advanceMs: MAX_CLOCK_AHEAD_MS })).statusCode).toBe(200);
+    const res = await tick({ pair: "btc_jpy", price: 1_000 });
+    expect(res.statusCode).toBe(200);
+    expect(store.now()).toBe(future + MAX_CLOCK_AHEAD_MS + 60_000);
+  });
+
+  /**
+   * 決定 28: 既存の記録（注文の orderedAt / canceledAt と trade の executedAt）より前へは
+   * 戻せない。記録より後であれば、いまの時刻より前へも戻せる。
+   */
+  describe("巻き戻し", () => {
+    const R = V0 + 10_000;
+    const records = () =>
+      setup({
+        lastTickAt: iso(V0 + 60_000),
+        balances: { jpy: 10_000_000, btc: 0.001 },
+        orders: [
+          buildOrder({ id: "1", orderedAt: iso(V0), updatedAt: iso(V0) }),
+          buildOrder({
+            id: "2",
+            status: "FULLY_FILLED",
+            executedAmount: 0.001,
+            executedNotional: 5_000,
+            orderedAt: iso(V0),
+            // updatedAt は記録に含めない（決定 28）。ここを下限にしないことも見る。
+            updatedAt: iso(V0 + 50_000),
+          }),
+        ],
+        trades: [buildTrade({ tradeId: "1", orderId: "2", price: 5_000_000, executedAt: iso(R) })],
+      });
+
+    it("記録より前は 400 CLOCK_BEFORE_RECORDS で断り、状態を変えない", async () => {
+      const { clock, store } = await records();
+      const before = JSON.stringify(store.state());
+      const res = await clock({ lastTickAt: R - 1 });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({ error: "CLOCK_BEFORE_RECORDS", minLastTickAt: iso(R) });
+      expect(JSON.stringify(store.state())).toBe(before);
+    });
+
+    it("記録ちょうどと、記録より後（いまより前）へは戻せる", async () => {
+      const { clock, store } = await records();
+      expect((await clock({ lastTickAt: iso(R + 1) })).statusCode).toBe(200);
+      expect(store.now()).toBe(R + 1);
+      expect((await clock({ lastTickAt: R })).statusCode).toBe(200);
+      expect(store.now()).toBe(R);
+    });
+
+    it("取消の時刻も記録に数える", async () => {
+      const C = V0 + 20_000;
+      const { clock } = await setup({
+        lastTickAt: iso(V0 + 60_000),
+        orders: [
+          buildOrder({
+            id: "1",
+            status: "CANCELED_UNFILLED",
+            orderedAt: iso(V0),
+            canceledAt: iso(C),
+          }),
+        ],
+      });
+      expect((await clock({ lastTickAt: C - 1 })).json()).toEqual({
+        error: "CLOCK_BEFORE_RECORDS",
+        minLastTickAt: iso(C),
+      });
+      expect((await clock({ lastTickAt: C })).statusCode).toBe(200);
+    });
+
+    // 実時刻モードで作った状態ファイルは、tick の約定が時計より最大 1 分先に記録されている。
+    // その時計から少しだけ進めても記録より前なので、同じく断る（記録以後へ置き直させる）。
+    it("時計が記録より前にある状態では、advanceMs でも記録より前には置けない", async () => {
+      const { clock } = await setup({
+        lastTickAt: iso(R - 60_000),
+        orders: [buildOrder({ id: "1", orderedAt: iso(V0) })],
+        trades: [buildTrade({ tradeId: "1", orderId: "1", executedAt: iso(R) })],
+      });
+      expect((await clock({ advanceMs: 1 })).json()).toEqual({
+        error: "CLOCK_BEFORE_RECORDS",
+        minLastTickAt: iso(R),
+      });
+      expect((await clock({ advanceMs: 60_000 })).statusCode).toBe(200);
+    });
+  });
+
+  /**
+   * tick は「いまの時刻から始まる 1 分足が閉じて、その終わりに約定し、時計もそこへ進む」
+   * （`docs/fidelity.md` の「仮想時計」節）。約定が時計より先に残らない。
+   */
+  describe("tick", () => {
+    const withOrder = () =>
+      setup({
+        balances: { jpy: 10_000_000 },
+        orders: [buildOrder({ id: "1", price: 5_000_000, orderedAt: iso(V0), updatedAt: iso(V0) })],
+      });
+
+    it("足の既定の timestamp はいまの時刻で、約定時刻と tick の後の時計が一致する", async () => {
+      const { tick, store } = await withOrder();
+      const res = await tick({ pair: "btc_jpy", price: 4_900_000 });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { filled: Array<{ executed_at: number }>; lastTickAt: string };
+      // いまの時刻に出した注文（orderedAt == V0）にも当たる。
+      expect(body.filled.map((t) => t.executed_at)).toEqual([V0 + 60_000]);
+      expect(body.lastTickAt).toBe(iso(V0 + 60_000));
+      expect(store.now()).toBe(V0 + 60_000);
+    });
+
+    it("約定の無い tick も 60 秒進む", async () => {
+      const { tick, store } = await withOrder();
+      const res = await tick({ pair: "btc_jpy", price: 6_000_000 });
+      expect(res.json()).toEqual({ filled: [], lastTickAt: iso(V0 + 60_000) });
+      expect(store.now()).toBe(V0 + 60_000);
+    });
+
+    it("足の timestamp を渡すと、その 1 分後に約定して時計もそこへ進む", async () => {
+      const { tick, store } = await withOrder();
+      const ts = V0 + 5 * 60_000 + 7;
+      const res = await tick({
+        pair: "btc_jpy",
+        candle: {
+          open: 4_900_000,
+          high: 4_900_000,
+          low: 4_900_000,
+          close: 4_900_000,
+          timestamp: ts,
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(store.state().trades.map((t) => t.executedAt)).toEqual([iso(ts + 60_000)]);
+      expect(store.now()).toBe(ts + 60_000);
+    });
+
+    it("いまの時刻より前の足は 400 CANDLE_BEFORE_CLOCK で断り、状態を変えない", async () => {
+      const { tick, store } = await withOrder();
+      const before = JSON.stringify(store.state());
+      const res = await tick({
+        pair: "btc_jpy",
+        candle: { open: 1, high: 1, low: 1, close: 1, timestamp: V0 - 1 },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({ error: "CANDLE_BEFORE_CLOCK", minTimestamp: V0 });
+      expect(JSON.stringify(store.state())).toBe(before);
+    });
+
+    it("tick の後の時計がいまの時刻 + 24 時間ちょうどなら通し、1 ミリ秒超えたら断る", async () => {
+      const edge = V0 + MAX_CLOCK_AHEAD_MS - 60_000;
+      const candleAt = (timestamp: number) => ({
+        pair: "btc_jpy",
+        candle: { open: 1, high: 1, low: 1, close: 1, timestamp },
+      });
+
+      const over = await withOrder();
+      const before = JSON.stringify(over.store.state());
+      const refused = await over.tick(candleAt(edge + 1));
+      expect(refused.statusCode).toBe(400);
+      expect(refused.json()).toEqual({ error: "CANDLE_TOO_FAR_AHEAD", maxTimestamp: edge });
+      expect(JSON.stringify(over.store.state())).toBe(before);
+
+      const exact = await withOrder();
+      expect((await exact.tick(candleAt(edge))).statusCode).toBe(200);
+      expect(exact.store.now()).toBe(V0 + MAX_CLOCK_AHEAD_MS);
+    });
+
+    it("何度 tick しても、約定時刻が時計より先に残らない", async () => {
+      const { tick, store, fastify } = await setup({ balances: { jpy: 100_000_000 } });
+      for (let i = 0; i < 5; i++) {
+        const placed = await fastify.inject({
+          method: "POST",
+          url: "/v1/user/spot/order",
+          payload: { pair: "btc_jpy", side: "buy", type: "limit", price: 5_000_000, amount: 0.001 },
+        });
+        expect(placed.json().data.ordered_at).toBe(store.now());
+        expect((await tick({ pair: "btc_jpy", price: 4_900_000 })).statusCode).toBe(200);
+        const clockMs = store.now();
+        for (const t of store.state().trades) {
+          expect(Date.parse(t.executedAt)).toBeLessThanOrEqual(clockMs);
+        }
+      }
+      expect(store.state().trades).toHaveLength(5);
+    });
+  });
+
+  // 決定 25: reset は状態を作り直す（`freshState()`）ので、時計は実時刻に戻る。
+  it("reset で時計は実時刻に戻り、以後の記録も実時刻から始まる", async () => {
+    const { clock, fastify, store } = await setup();
+    await clock({ advanceMs: MAX_CLOCK_AHEAD_MS });
+    const before = Date.now();
+    expect((await fastify.inject({ method: "POST", url: "/_control/reset" })).statusCode).toBe(200);
+    const after = Date.now();
+    expect(store.now()).toBeGreaterThanOrEqual(before);
+    expect(store.now()).toBeLessThanOrEqual(after);
+    const placed = await fastify.inject({
+      method: "POST",
+      url: "/v1/user/spot/order",
+      payload: { pair: "btc_jpy", side: "buy", type: "limit", price: 5_000_000, amount: 0.001 },
+    });
+    expect(placed.json().data.ordered_at).toBe(store.now());
+    expect(store.clockMode).toBe("virtual");
   });
 });

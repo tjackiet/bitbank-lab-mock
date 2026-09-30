@@ -56,6 +56,7 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 
 - [control の時計](#control-の時計) — `POST /_control/clock` を足し、時計が実時刻より先へ進める幅を 24 時間に制限した（超える要求は 400 で断り、状態を変えない）
 - [control の時計](#control-の時計) — market モードで時計が未来にあるとき足の取得を飛ばして warn を出す（改訂前: 逆転した範囲で問い合わせ、警告もエラーも無いまま約定が止まっていた）
+- [仮想時計](#仮想時計) / [control の時計](#control-の時計) — `BITBANK_MOCK_CLOCK=virtual`（control 有効かつ manual のときだけ。他の設定と同時に指定されたら起動を断る）で、互換ルートと `/_control/` が記録する時刻を `/_control/` から動かす仮想時計にできるようにし、`POST /_control/clock` に `{ advanceMs }` を足した（改訂前: 記録する時刻は常に実時刻で、`/_control/clock` は `lastTickAt` の絶対指定だけ。`{ advanceMs }` は未知のキーとして読まれず、本文の省略と同じく時計を現在時刻へ戻していた）
 - [control の fill / tick 検証](#control-の-fill--tick-検証) — 足の `timestamp` を `Date` の表現範囲から下流の加算分を引いた範囲に制限し、`tick` の `pair` と `reset` の `balances` のキーも検証する
 - [control のアクセス境界](#control-のアクセス境界) — 許可判定を TCP の対向アドレスに固定し、`X-Control-Token` はヘッダ行がちょうど 1 本のときだけ受け、一致を `timingSafeEqual` で見る
 - [`/_control/`](#_control) — `GET /_control/state` に状態ファイルへの書き出しの状況（`persist`）を添える
@@ -531,7 +532,7 @@ Plan A は maker / taker 表示に関わらず**単一の料率**で計算する
 
 ### active_orders の絞り込み
 
-`count` / `from_id` / `end_id` / `since` / `end` を受け、生成順のまま絞る。`from_id`/`end_id` は inclusive、`since`/`end` は `ordered_at` のミリ秒 inclusive
+`count` / `from_id` / `end_id` / `since` / `end` を受け、生成順のまま絞る。`from_id`/`end_id` は inclusive、`since`/`end` は `ordered_at` のミリ秒 inclusive。時刻では並べ替えないので、同じ `ordered_at` の注文は id 順に並ぶ（仮想時計では時計を進めない限り同じ時刻が並ぶ。同じ表の「仮想時計」節）
 
 - **根拠**: REST API: Fetch active orders
 - **本物との差異**: 公式の since/end が秒かミリ秒かは明記なし
@@ -542,7 +543,7 @@ Plan A は maker / taker 表示に関わらず**単一の料率**で計算する
 
 ### trade_history の絞り込み
 
-`order_id` / `since` / `end` / `order(asc|desc)` を追加。`since`/`end` は `executed_at` のミリ秒 inclusive。既定は `desc`（新しい順）。`count` 指定時は最大 1000 で、超過は断らずに切り詰める。未指定なら全件
+`order_id` / `since` / `end` / `order(asc|desc)` を追加。`since`/`end` は `executed_at` のミリ秒 inclusive。既定は `desc`（新しい順）。`count` 指定時は最大 1000 で、超過は断らずに切り詰める。未指定なら全件。`desc` は生成順を逆にするだけで時刻では並べ替えないので、同じ `executed_at` の約定は `desc` なら id の逆順、`asc` なら id 順に並ぶ（同じ表の「仮想時計」節）
 
 - **根拠**: REST API: Fetch trade history（パラメータ表の `count | number | NO | take limit (up to 1000)`。`Fetch active orders` の同じ欄は `take limit` だけで上限が無く、モックも `active_orders` には上限を置いていない）
 - **本物との差異**: 公式の既定件数は未確認。モックは未指定で全件返す。**上限を超えた `count` を実 API が断るのか切り詰めるのかも公式に記載が無く、未実測**。モックは切り詰める側を選んでいる
@@ -722,7 +723,7 @@ Plan A は認証ヘッダを検証しない。private stream の WebSocket（`/_
 
 ### `/_control/`
 
-`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/orders/:id/reject`（`UNFILLED` / `INACTIVE` の注文を `REJECTED` にする。下の段落）、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`POST /_control/stream/hold`・`GET /_control/stream/held`・`POST /_control/stream/release`（private stream の保留・再送。同じ表の「private stream の保留・再送」節）、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。保留・再送の 3 つは状態ファイルに書かないので劣化中も通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
+`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/orders/:id/reject`（`UNFILLED` / `INACTIVE` の注文を `REJECTED` にする。下の段落）、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`POST /_control/stream/hold`・`GET /_control/stream/held`・`POST /_control/stream/release`（private stream の保留・再送。同じ表の「private stream の保留・再送」節）、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。仮想時計のときは `clock: { mode: "virtual" }` も添える（同じ表の「仮想時計」節。実時刻モードでは付けない）。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。保留・再送の 3 つは状態ファイルに書かないので劣化中も通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
 
 **`reject` は `fill` と対になる口である。** 本文は読まず、`UNFILLED` / `INACTIVE` の注文を `REJECTED` にして、`{ "order": … }` を返す（`order` は `fill` の応答の `order` と同じ形で、値は同じ時点の `GET order` と同じ。約定は起きないので `trade` は持たない）。存在しない注文は 404 `{"error":"ORDER_NOT_FOUND"}`、それ以外の状態は 409 `{"error":"ORDER_NOT_ACTIVE","status":…}` で、どちらも状態を変えない。**部分約定済みの注文を断るのは不変量 2**（`REJECTED` の約定量は 0。下の「6 本の不変量」）のためで、約定した分を残して止めたいなら取消（`CANCELED_PARTIALLY_FILLED`）を使う。残高は動かさず、拘束だけが外れる（拘束は active な注文から計算する）。取消ではないので `canceled_at` は埋めず、拒否した時刻は REST の応答に出ない。private stream には `REJECTED` の `spot_order` と、拘束が外れた資産の `asset_update` が流れる（保留中なら他のメッセージと同じく溜まる。同じ表の「private stream の注文ペイロード」節）
 
@@ -755,17 +756,47 @@ control 有効時の既定は `BITBANK_MOCK_FILL_MODE=manual`。`store.tick()` �
 
 ### control の時計
 
-`POST /_control/tick` は状態の `lastTickAt` を `max(現在時刻, 前回 + 60 秒, 足の timestamp)` へ進める。1 回の tick で必ず 60 秒以上進み（1 分足が同じ実時刻の 2 本でも別の窓に落ちるため）、tick では**巻き戻らない**。**ただし実時刻より先へ進める幅は 24 時間まで**（`src/routes/control.ts` の `MAX_CLOCK_AHEAD_MS`）。足の `timestamp` が `現在時刻 + 24 時間` を超えると 400 `CANDLE_TOO_FAR_AHEAD`（`maxTimestamp` 付き）、60 秒の単調前進だけで超えるとき（＝時計が上限の 60 秒手前まで来ているとき）は 400 `CLOCK_TOO_FAR_AHEAD`（`lastTickAt` / `maxLastTickAt` 付き）で、どちらも状態を変えない。進める経路はこの 2 つだけなので、`4e12`（西暦 2096）や `1e15`（西暦 33658）を渡しても、tick を何回重ねても、時計が実時間から 24 時間より離れることはない。上限にクランプせず断るのは、足の timestamp を黙って書き換えると約定時刻（`candle.timestamp + 1 分`）がずれ、60 秒の前進を黙って縮めると同じ実時刻の 2 本が同じ窓・同じ約定時刻に落ちるため。**戻す手段は `POST /_control/clock`**（本文省略で現在時刻、`{ lastTickAt }` に ISO 文字列かエポックミリ秒で任意の時刻。注文・約定・残高はそのまま残る。範囲外の値と、本文そのものが record でないとき（配列・`null`・数値・文字列。本文の省略だけが「現在時刻へ戻す」）は 400 `INVALID_CLOCK`、`現在時刻 + 24 時間` 超は 400 `CLOCK_TOO_FAR_AHEAD`）。`POST /_control/reset`（注文・約定・残高を全部捨てる）でも戻るが、シナリオは失われる。過去の `timestamp` は今までどおり通る（上限は先の側だけに効く）。**market モードとの相互作用**: `BITBANK_MOCK_FILL_MODE=market` で `lastTickAt` が実時刻より先にあると、`SessionStore.tick()` の足の取得範囲が `(未来, 現在)` と逆転する。逆転した範囲で取った足は `runTick` の窓（`fromMs = min(lastTickAt, now)` 以上 `now` 以下）から全部外れて 1 本も約定しないので、**取得自体を飛ばし `tick: lastTickAt "..." is ahead of now "..."; skipping candle fetch` を warn で出す**（v0.1.0 からの改訂。改訂前は逆転した範囲で問い合わせ、警告もエラーも無いまま約定が止まっていた）。この後 `SessionStore.tick()` は tick の最後で `lastTickAt` を現在時刻で上書きするので、未来へ進めた時計はそこで巻き戻り、次の tick は今までどおり取得して約定する（警告が出るのは 1 回）。この回だけは約定が 0 でも状態ファイルへ書く（書かないと再起動でファイルから未来の時計を読み直し、同じ空振りを繰り返すため）。24 時間の上限があるので、`lastTickAt` が `8.64e15 − 9 時間` を超えて market モードの足取得の日付が `NaNNaNNaN` になる経路は `/_control/tick` からは届かない
+**この節は実時刻モード（既定）の規則である。** `BITBANK_MOCK_CLOCK=virtual` の規則は同じ表の「仮想時計」節にあり、上限の基準と巻き戻しの扱いが違う。
+
+`POST /_control/tick` は状態の `lastTickAt` を `max(現在時刻, 前回 + 60 秒, 足の timestamp)` へ進める。1 回の tick で必ず 60 秒以上進み（1 分足が同じ実時刻の 2 本でも別の窓に落ちるため）、tick では**巻き戻らない**。約定時刻は `足の timestamp + 1 分` なので、**tick の後の時計より最大 1 分先に記録される**（仮想時計ではこれを揃えた）。**ただし実時刻より先へ進める幅は 24 時間まで**（`src/routes/control.ts` の `MAX_CLOCK_AHEAD_MS`）。足の `timestamp` が `現在時刻 + 24 時間` を超えると 400 `CANDLE_TOO_FAR_AHEAD`（`maxTimestamp` 付き）、60 秒の単調前進だけで超えるとき（＝時計が上限の 60 秒手前まで来ているとき）は 400 `CLOCK_TOO_FAR_AHEAD`（`lastTickAt` / `maxLastTickAt` 付き）で、どちらも状態を変えない。進める経路はこの 2 つだけなので、`4e12`（西暦 2096）や `1e15`（西暦 33658）を渡しても、tick を何回重ねても、時計が実時間から 24 時間より離れることはない。上限にクランプせず断るのは、足の timestamp を黙って書き換えると約定時刻（`candle.timestamp + 1 分`）がずれ、60 秒の前進を黙って縮めると同じ実時刻の 2 本が同じ窓・同じ約定時刻に落ちるため。**戻す手段は `POST /_control/clock`**（本文省略で現在時刻、`{ lastTickAt }` に ISO 文字列かエポックミリ秒で任意の時刻、`{ advanceMs }` にいまの `lastTickAt` から進めるミリ秒。注文・約定・残高はそのまま残り、`updatedAt` は実時刻で書く。範囲外の値と、本文そのものが record でないとき（配列・`null`・数値・文字列。本文の省略だけが「現在時刻へ戻す」）と、`advanceMs` が正の整数でないときと、`lastTickAt` と `advanceMs` を両方渡したときは 400 `INVALID_CLOCK`、`現在時刻 + 24 時間` 超は 400 `CLOCK_TOO_FAR_AHEAD`）。**`advanceMs` は 1 回で 24 時間まで**で、時計が過去にあっても `lastTickAt + 24 時間` を超えては進めない（`CLOCK_TOO_FAR_AHEAD` の `maxLastTickAt` は `min(現在時刻, lastTickAt) + 24 時間`）。`POST /_control/reset`（注文・約定・残高を全部捨てる）でも戻るが、シナリオは失われる。過去の `timestamp` は今までどおり通る（上限は先の側だけに効く）。**market モードとの相互作用**: `BITBANK_MOCK_FILL_MODE=market` で `lastTickAt` が実時刻より先にあると、`SessionStore.tick()` の足の取得範囲が `(未来, 現在)` と逆転する。逆転した範囲で取った足は `runTick` の窓（`fromMs = min(lastTickAt, now)` 以上 `now` 以下）から全部外れて 1 本も約定しないので、**取得自体を飛ばし `tick: lastTickAt "..." is ahead of now "..."; skipping candle fetch` を warn で出す**（v0.1.0 からの改訂。改訂前は逆転した範囲で問い合わせ、警告もエラーも無いまま約定が止まっていた）。この後 `SessionStore.tick()` は tick の最後で `lastTickAt` を現在時刻で上書きするので、未来へ進めた時計はそこで巻き戻り、次の tick は今までどおり取得して約定する（警告が出るのは 1 回）。この回だけは約定が 0 でも状態ファイルへ書く（書かないと再起動でファイルから未来の時計を読み直し、同じ空振りを繰り返すため）。24 時間の上限があるので、`lastTickAt` が `8.64e15 − 9 時間` を超えて market モードの足取得の日付が `NaNNaNNaN` になる経路は `/_control/tick` からは届かない
 
 - **根拠**: 本モック固有
 - **本物との差異**: 本物の取引所には対応する概念がない
 - **推測**: はい
   - 確認先 **モックの設計判断**: 時計を実時刻より先へ進める幅を 24 時間に制限すること
-- **利用側への含意**: **24 時間の根拠**: `runTick` が 1 回の tick で遡る上限（`MAX_LOOKBACK_MS`）と同じ幅で、1 分足なら 1 日分（1440 本）。合成の tick を 1440 回重ねるまでは今までどおり通る。#20 / #21 で入れた `timestamp` の上限（`Date` の表現範囲 − JST オフセット = `8.64e15 − 9 時間`。同じ表の「control の fill / tick 検証」節）とは別の、その内側にある制約。利用側は `lastTickAt` を実時間と見なさない
+  - 確認先 **モックの設計判断**: `POST /_control/clock` の `{ advanceMs }` を実時刻モードでも受け、1 回で進める幅を 24 時間に限ること
+- **利用側への含意**: **24 時間の根拠**: `runTick` が 1 回の tick で遡る上限（`MAX_LOOKBACK_MS`）と同じ幅で、1 分足なら 1 日分（1440 本）。合成の tick を 1440 回重ねるまでは今までどおり通る。#20 / #21 で入れた `timestamp` の上限（`Date` の表現範囲 − JST オフセット = `8.64e15 − 9 時間`。同じ表の「control の fill / tick 検証」節）とは別の、その内側にある制約。利用側は `lastTickAt` を実時間と見なさない。**実時刻モードでは互換ルートが記録する時刻（`ordered_at` / `canceled_at`、`/_control/` の fill の約定時刻）は実時刻のままで、この時計では動かない**——動かしたいときは仮想時計を使う
+
+### 仮想時計
+
+`BITBANK_MOCK_CLOCK=virtual` で起動すると、状態の `lastTickAt` がそのまま「いまの時刻」になり（`SessionStore.now()`）、互換ルートと `/_control/` が記録する時刻——`ordered_at`、`canceled_at`、`/_control/` の fill の約定時刻と reject の時刻（`updatedAt`）、tick の約定時刻、private stream の `executed_at`——をすべてこの時計で打つ。**時計は自分では進まない。** 動くのは `POST /_control/clock` と `POST /_control/tick` だけで、時計を進めない限り、続けて出した注文の `ordered_at` は同じ値になる（前後は `order_id` で分かる。`active_orders` と `trade_history` は時刻で並べ替えず生成順のまま返すので、同じ時刻どうしは id 順——`trade_history` の既定の `desc` なら id の逆順——に並ぶ。同じ表の「active_orders の絞り込み」節・「trade_history の絞り込み」節）。スキーマは v3 のままで、時計は状態ファイルに残るので**再起動しても続く**。`POST /_control/reset` は状態を作り直す（`freshState()`）ので**時計は実時刻に戻る**（モードは仮想のままで、戻った時刻から先は自分では進まない）
+
+**有効にする条件**: 環境変数で明示したときだけで、有効になるのは `BITBANK_MOCK_CONTROL=1` かつ manual モード（`BITBANK_MOCK_FILL_MODE` が未設定か `manual`）のときだけ。それ以外——control 無効（時計を動かす口が無い）、market モード（足を実時刻の窓で取るので、時計を実時刻から離すと取得の窓が意味を失う）、その両方——と同時に指定されたら**起動を断る**。判定は状態ファイルに触れる前で、当たった理由をすべて標準エラーに出して終了コード 1 で終わる（ロックも取らない）。warn を出して実時刻へ落とす形にしないのは、見落とすと時計を進めたつもりの実験が黙って実時刻で走るため。空文字と未知の値は既定（実時刻）に落とす（他の環境変数と同じ規則）。状態ファイルの `lastTickAt` が日付として解釈できないときも起動しない（記録する時刻が作れず、互換ルートが封筒でない 500 を返すため。実時刻モードは `lastTickAt` を記録に使わないので従来どおり起動する）。**効いているかは `GET /_control/state` の `clock: { mode: "virtual" }` で確かめる**（実時刻モードの応答の形は変えていないので、付かない。無いことが実時刻の印）
+
+**`POST /_control/clock`**: 本文の省略と `{}` は 400 `CLOCK_TARGET_REQUIRED`（実時刻モードの「現在時刻へ戻す」は仮想時計では意味が無く、黙って実時刻へ飛ぶと以後の記録が実時刻になるため）。`{ advanceMs }` はいまの時刻から N ミリ秒進め（正の整数）、`{ lastTickAt }` は絶対指定。**上限はいまの仮想時刻 + 24 時間**（`MAX_CLOCK_AHEAD_MS` を「1 回で進める幅」として使い回し、実時刻からの上限は外した）で、超えると 400 `CLOCK_TOO_FAR_AHEAD`（`maxLastTickAt` 付き）。繰り返せば何日でも先へ進める（24 時間ずつ 2 回で 48 時間先）。**既存の記録より前へは置けない**: 記録とみなすのは注文の `orderedAt` / `canceledAt` と約定（trade）の `executedAt` で（`updatedAt` と `lastTickAt` は含めない。日付として解釈できない記録は比べようがないので数えない）、その最大より前は 400 `CLOCK_BEFORE_RECORDS`（`minLastTickAt` 付き）。記録ちょうどと記録より後なら、いまの時刻より前へも戻せる。記録より前へ戻したいときは reset する。値の形の検査（`INVALID_CLOCK`）は実時刻モードと同じ。状態の `updatedAt` は clock では実時刻で書く（実時刻モードと同じ）。一方、遷移関数を通る変化（発注・約定・取消・拒否・tick）は `updatedAt` も記録と同じ仮想時刻で書くので、**仮想時計の `updatedAt` は実時刻と仮想時刻が混ざる**——記録ではなく（決定 28）、時刻の順にも使えない
+
+**`POST /_control/tick`**: **「いまの時刻から始まる 1 分足が閉じて、その終わりに約定し、時計もそこへ進む」**形にする。足の `timestamp` の既定（`{ price }` の合成の足と、`candle.timestamp` の省略）はいまの時刻で、いまの時刻に出した注文にも当たる。tick の後の時計は `timestamp + 1 分` で、約定時刻（`timestamp + 1 分`）と同じ値になるので、**約定が時計より先に残らない**（実時刻モードでは最大 1 分先に残る。同じ表の「control の時計」節）。約定が無くても 1 回で必ず 60 秒以上進む。いまの時刻より前の足は 400 `CANDLE_BEFORE_CLOCK`（`minTimestamp` 付き。約定時刻が既存の記録より前になり得るため、clock の下限と揃えた）。上限は tick の後の時計がいまの時刻 + 24 時間を超えないところで、足の `timestamp` が `いまの時刻 + 24 時間 − 1 分` を超えると 400 `CANDLE_TOO_FAR_AHEAD`（`maxTimestamp` 付き）。足の値と `timestamp` の表現範囲の検査（同じ表の「control の fill / tick 検証」節）はそのまま効く。どれで断っても状態は変えない
+
+**成行**: 価格は**実時刻の窓**（直近 5 分）で公開 API から取り、記録する時刻（`ordered_at` と約定時刻）だけを仮想にする。仮想時刻を基準に窓を切ると、時計を実時刻より先へ進めた途端に窓の中の足が無くなり、成行が常に `70001` で断られるため。したがって仮想時刻に記録した成行の約定価格は、その時刻の市場価格ではない。`GET /_control/state` の `candles.lastSuccessAt` も実時刻（取得の窓の終端）で記録するので、仮想時計では `lastTickAt` と並べて読めない
+
+**実時刻モードで作った状態ファイルを仮想時計で読むとき**: 実時刻モードの tick は約定を時計より最大 1 分先に記録するので、時計が記録より前にあることがある。そのまま発注すると `ordered_at` が既存の約定より前になる。`POST /_control/clock` で記録以後へ置き直してから使う（記録より前へは置けないので、進める幅が足りなければ `advanceMs` でも `CLOCK_BEFORE_RECORDS` で断られ、`minLastTickAt` に置き先が出る）
+
+- **根拠**: 本モック固有（`docs/plan-lab-mock.md` 17.2 の決定 24〜28 と 17.5。`src/store/session.ts` の `now()`、`src/routes/control.ts` の `POST /tick` / `POST /clock`、`src/server/config.ts` の `virtualClockConflicts()`）
+- **本物との差異**: 本物の取引所には対応する概念がない（時刻は取引所の時計で打たれる）
+- **推測**: はい
+  - 確認先 **モックの設計判断**: 仮想時計を環境変数で明示したときだけ、control 有効かつ manual モードでのみ有効にし、他の設定と同時に指定されたら起動を断ること（決定 24）
+  - 確認先 **モックの設計判断**: 時計の値に `lastTickAt` を使い回し、tick で 60 秒以上進むことと reset で実時刻に戻ることを受け入れること（決定 25）
+  - 確認先 **モックの設計判断**: 時計は自分では進まず `POST /_control/clock` と tick でだけ動くこと、本文を省いた clock を 400 で断ること（決定 26）
+  - 確認先 **モックの設計判断**: 1 回で進める幅を 24 時間に限り、実時刻からの上限を外すこと（決定 27）
+  - 確認先 **モックの設計判断**: 既存の記録より前へ時計を置けず、いまの時刻より前の足も断ること（決定 28）
+  - 確認先 **モックの設計判断**: tick の足の既定の `timestamp` をいまの時刻にし、tick の後の時計を約定時刻（`timestamp + 1 分`）に揃えること
+  - 確認先 **モックの設計判断**: 成行の価格を実時刻の窓で取り、記録する時刻だけを仮想にすること（成行は Plan A で互換を主張する範囲の外。`docs/plan-a-readiness.md` の 1 節）
+  - 確認先 **モックの設計判断**: 仮想時計が効いていることを `GET /_control/state` の `clock` で見せ、実時刻モードでは付けないこと
+- **利用側への含意**: 有効期限（境界の時刻を有効に含む）は、境界ちょうどと 1 ミリ秒後を `advanceMs` で分けて踏める。JST の暦日の窓は 24 時間ずつ進めて何日でも先へ行ける。再起動をまたいで時計が続くので、「再同期」を仮想時刻のまま試せる。**時計を進めない限り同じ時刻の記録が並ぶ**ので、時刻だけで前後を決めず id で決める。**成行の約定価格は仮想時刻の市場価格ではない**（Plan A の範囲の外）
 
 ### control の fill / tick 検証
 
-存在しない注文 404、終端 409。`POST /_control/tick` の `pair` は互換ルートと同じ検証（`pairAssets`）を通らなければ 400 `INVALID_PAIR`。`amount` が非正・残量超過・桁溢れは 400 `INVALID_AMOUNT`。`price` が非正・非有限は 400 `INVALID_PRICE`。足は `0 < low <= open <= high` かつ `low <= close <= high` の有限値で、`timestamp` は `Date` の表現範囲から下流の加算分を引いた範囲（`-8.64e15 <= t <= 8.64e15 − 9 時間`。上側だけ JST オフセット分の余裕を取るので非対称）に収まること。さらに `timestamp` が `現在時刻 + 24 時間` を超えるものは 400 `CANDLE_TOO_FAR_AHEAD`、60 秒の単調前進だけでその幅を超える tick は 400 `CLOCK_TOO_FAR_AHEAD`（同じ表の「control の時計」節）。`POST /_control/clock` の `lastTickAt` は ISO 文字列かエポックミリ秒で、同じ 2 つの範囲を外れると 400 `INVALID_CLOCK` / 400 `CLOCK_TOO_FAR_AHEAD`。`POST /_control/reset` の `balances` のキーは互換ルートと同じ文字種（`[a-z0-9]+`、`pairAssets` のセグメント）に限り、外れるものは 400 `INVALID_BALANCES`。**値と `initialJpy` は有限の非負数で、`0` は通す**（負・非有限・数値でないものは 400 `INVALID_BALANCES`）——残高 0 から始めて発注が残高不足で断られることを確かめる筋を塞がないため。`fill` / `tick` の非正が断られる側であるのに対し、ここだけ `0` が**受け入れる側**である。拒否時は状態を変えない（`fill` / `reject` / `tick` / `clock` / `reset` の全拒否経路で確認済み。`reject` の断り方は同じ表の「`/_control/`」節）
+存在しない注文 404、終端 409。`POST /_control/tick` の `pair` は互換ルートと同じ検証（`pairAssets`）を通らなければ 400 `INVALID_PAIR`。`amount` が非正・残量超過・桁溢れは 400 `INVALID_AMOUNT`。`price` が非正・非有限は 400 `INVALID_PRICE`。足は `0 < low <= open <= high` かつ `low <= close <= high` の有限値で、`timestamp` は `Date` の表現範囲から下流の加算分を引いた範囲（`-8.64e15 <= t <= 8.64e15 − 9 時間`。上側だけ JST オフセット分の余裕を取るので非対称）に収まること。さらに `timestamp` が `現在時刻 + 24 時間` を超えるものは 400 `CANDLE_TOO_FAR_AHEAD`、60 秒の単調前進だけでその幅を超える tick は 400 `CLOCK_TOO_FAR_AHEAD`（同じ表の「control の時計」節）。`POST /_control/clock` の `lastTickAt` は ISO 文字列かエポックミリ秒で、同じ 2 つの範囲を外れると 400 `INVALID_CLOCK` / 400 `CLOCK_TOO_FAR_AHEAD`。`advanceMs` は正の整数でなければ 400 `INVALID_CLOCK`（`lastTickAt` と両方渡しても同じ）。仮想時計では基準がいまの仮想時刻に替わり、下限（400 `CANDLE_BEFORE_CLOCK` / `CLOCK_BEFORE_RECORDS`）と本文の省略の拒否（400 `CLOCK_TARGET_REQUIRED`）が加わる（同じ表の「仮想時計」節）。`POST /_control/reset` の `balances` のキーは互換ルートと同じ文字種（`[a-z0-9]+`、`pairAssets` のセグメント）に限り、外れるものは 400 `INVALID_BALANCES`。**値と `initialJpy` は有限の非負数で、`0` は通す**（負・非有限・数値でないものは 400 `INVALID_BALANCES`）——残高 0 から始めて発注が残高不足で断られることを確かめる筋を塞がないため。`fill` / `tick` の非正が断られる側であるのに対し、ここだけ `0` が**受け入れる側**である。拒否時は状態を変えない（`fill` / `reject` / `tick` / `clock` / `reset` の全拒否経路で確認済み。`reject` の断り方は同じ表の「`/_control/`」節）
 
 - **根拠**: 本モック固有（不変量 1 の防御）
 - **本物との差異**: 本物には無い
