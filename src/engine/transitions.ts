@@ -273,10 +273,11 @@ export function cancelOrder(state: PaperState, orderId: string, at: string): Res
  * それ以外は `ORDER_NOT_ACTIVE`、不在は `ORDER_NOT_FOUND`（状態は変えない）。
  * 約定済みの注文を拒否できないのは不変量 2（`REJECTED` の約定量は 0）を保つため。
  *
- * **互換ルートからも `/_control/` からも呼んでいない。** 現状の呼び出し元はテストだけで、
- * 応答経路で `REJECTED` に出会うのは状態ファイルが最初からその状態を持っていた場合に限る
- * （`PaperStateSchema` は status を enum で受けるので読み込みは通る）。
- * `src/routes/cancel-order.ts` が `REJECTED` を `ORDER_NOT_FOUND` に落とすのはその経路のため。
+ * **呼び出し元は `/_control/` の `POST /_control/orders/:order_id/reject` だけで、互換ルートは
+ * 呼ばない**（実 API がどの条件で `REJECTED` にするかは公式に書かれていない）。応答経路で
+ * `REJECTED` に出会うのは、この口で拒否した注文と、状態ファイルが最初からその状態を持っていた
+ * 注文である（`PaperStateSchema` は status を enum で受けるので読み込みは通る）。
+ * `src/routes/cancel-order.ts` はどちらも `ORDER_NOT_FOUND` に落とす。
  */
 export function rejectOrder(state: PaperState, orderId: string, at: string): Result<TransitionOk> {
   const current = state.orders.find((o) => o.id === orderId);

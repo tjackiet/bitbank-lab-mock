@@ -4,7 +4,7 @@ import { join } from "node:path";
 import Fastify from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadState } from "../../src/engine/persist.ts";
-import { activeOrders } from "../../src/engine/state.ts";
+import { activeOrders, type OrderRecord, type OrderStatus } from "../../src/engine/state.ts";
 import { controlRoutes, controlTokenHeader } from "../../src/routes/control.ts";
 import { buildServer } from "../../src/server/http.ts";
 import { SessionStore } from "../../src/store/session.ts";
@@ -343,6 +343,138 @@ describe("/_control routes", () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: "INVALID_PRICE" });
+  });
+
+  describe("POST /_control/orders/:order_id/reject", () => {
+    /** jpy の `locked_amount`（`GET /v1/user/assets` の見え方）。 */
+    async function lockedJpy(fastify: Awaited<ReturnType<typeof setup>>["fastify"]) {
+      const res = await fastify.inject({ method: "GET", url: "/v1/user/assets" });
+      const assets = res.json().data.assets as Array<{ asset: string; locked_amount: string }>;
+      return assets.find((a) => a.asset === "jpy")?.locked_amount;
+    }
+
+    it("UNFILLED の注文を REJECTED にし、GET order と同じ注文を素の JSON で返す。拘束が外れる", async () => {
+      const { fastify, store } = await setup();
+      const balances = store.state().balances;
+      expect(await lockedJpy(fastify)).toBe("5006.0000");
+
+      const res = await fastify.inject({ method: "POST", url: "/_control/orders/1/reject" });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { order: { status: string; executed_amount: string } };
+      // fill の `{ order, trade }` と違い、約定が起きないので `order` だけ。
+      expect(Object.keys(body)).toEqual(["order"]);
+      expect(body.order.status).toBe("REJECTED");
+      expect(body.order.executed_amount).toBe("0.0000");
+      const fetched = await fastify.inject({
+        method: "GET",
+        url: "/v1/user/spot/order?pair=btc_jpy&order_id=1",
+      });
+      expect(body.order).toEqual(fetched.json().data);
+
+      expect(store.state().orders[0]).toMatchObject({ status: "REJECTED", canceledAt: null });
+      expect(activeOrders(store.state())).toHaveLength(0);
+      expect(store.state().trades).toEqual([]);
+      // 残高は動かさず、拘束だけが外れる（拘束は active な注文から計算する）。
+      expect(store.state().balances).toEqual(balances);
+      expect(await lockedJpy(fastify)).toBe("0.0000");
+    });
+
+    it("INACTIVE の注文も REJECTED にする", async () => {
+      const { fastify, store } = await setup(
+        buildState({ orders: [buildOrder({ id: "1", status: "INACTIVE" })] }),
+      );
+      const res = await fastify.inject({ method: "POST", url: "/_control/orders/1/reject" });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().order.status).toBe("REJECTED");
+      expect(store.state().orders[0]?.status).toBe("REJECTED");
+    });
+
+    it("存在しない注文は 404 ORDER_NOT_FOUND で、状態を変えない", async () => {
+      const { fastify, store } = await setup();
+      const before = JSON.stringify(store.state());
+      const res = await fastify.inject({ method: "POST", url: "/_control/orders/999/reject" });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toEqual({ error: "ORDER_NOT_FOUND" });
+      expect(JSON.stringify(store.state())).toBe(before);
+    });
+
+    /**
+     * 受け付けるのは `UNFILLED` と `INACTIVE` だけ。**部分約定済みを断るのは不変量 2**
+     * （`REJECTED` の約定量は 0）のためで、終端の 4 状態は不変量 4（終端は以後変わらない）の
+     * ため。`REJECTED` 自身も 2 度目は断る。
+     */
+    it.each<[OrderStatus, Partial<OrderRecord>]>([
+      ["PARTIALLY_FILLED", { executedAmount: 0.0004, executedNotional: 2_000 }],
+      ["FULLY_FILLED", { executedAmount: 0.001, executedNotional: 5_000 }],
+      ["CANCELED_UNFILLED", { canceledAt: "2026-01-01T00:01:00.000Z" }],
+      [
+        "CANCELED_PARTIALLY_FILLED",
+        {
+          executedAmount: 0.0004,
+          executedNotional: 2_000,
+          canceledAt: "2026-01-01T00:01:00.000Z",
+        },
+      ],
+      ["REJECTED", {}],
+    ])(
+      "%s の注文は 409 ORDER_NOT_ACTIVE（status を添える）で断り、状態を変えない",
+      async (status, overrides) => {
+        const { fastify, store } = await setup(
+          buildState({ orders: [buildOrder({ id: "1", status, ...overrides })] }),
+        );
+        const before = JSON.stringify(store.state());
+        const res = await fastify.inject({ method: "POST", url: "/_control/orders/1/reject" });
+        expect(res.statusCode).toBe(409);
+        expect(res.json()).toEqual({ error: "ORDER_NOT_ACTIVE", status });
+        expect(JSON.stringify(store.state())).toBe(before);
+      },
+    );
+
+    it("REJECTED にした注文の取消は cancel_order も cancel_orders も 50009 で、1 件も取り消さない", async () => {
+      const { fastify, store } = await setup(
+        buildState({
+          orders: [buildOrder({ id: "1" }), buildOrder({ id: "2" })],
+        }),
+      );
+      const rejected = await fastify.inject({ method: "POST", url: "/_control/orders/1/reject" });
+      expect(rejected.statusCode).toBe(200);
+
+      const single = await fastify.inject({
+        method: "POST",
+        url: "/v1/user/spot/cancel_order",
+        payload: { pair: "btc_jpy", order_id: 1 },
+      });
+      expect(single.json()).toEqual({ success: 0, data: { code: 50009 } });
+      // active な 2 と混ぜても、終端が混ざった一括取消は 1 件も取り消さない。
+      const batch = await fastify.inject({
+        method: "POST",
+        url: "/v1/user/spot/cancel_orders",
+        payload: { pair: "btc_jpy", order_ids: [2, 1] },
+      });
+      expect(batch.json()).toEqual({ success: 0, data: { code: 50009 } });
+      expect(store.state().orders.map((o) => o.status)).toEqual(["REJECTED", "UNFILLED"]);
+    });
+
+    // fill と同じく /_control/ の中に閉じる。互換ルートの仕様に混ざらない。
+    it("非ループバックは 403、control 無効時は 404 で、どちらも状態を変えない", async () => {
+      const { fastify, store } = await setup(undefined, { token: "secret" });
+      const before = JSON.stringify(store.state());
+      const forbidden = await fastify.inject({
+        method: "POST",
+        url: "/_control/orders/1/reject",
+        remoteAddress: "10.0.0.8",
+      });
+      expect(forbidden.statusCode).toBe(403);
+      expect(JSON.stringify(store.state())).toBe(before);
+
+      const { fastify: disabled, store: disabledStore } = await setup(undefined, {
+        controlEnabled: false,
+      });
+      const notFound = await disabled.inject({ method: "POST", url: "/_control/orders/1/reject" });
+      expect(notFound.statusCode).toBe(404);
+      expect(disabledStore.state().orders[0]?.status).toBe("UNFILLED");
+    });
   });
 
   it("ticks matching orders from a synthetic price", async () => {

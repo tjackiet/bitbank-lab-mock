@@ -185,7 +185,8 @@ cancelOrder(state, orderId, at)           → { state, order }
    // UNFILLED → CANCELED_UNFILLED、PARTIALLY_FILLED → CANCELED_PARTIALLY_FILLED
    // 終端状態なら Result.error（呼び出し側が 50026 / 50027 に変換）
 rejectOrder(state, orderId, at)           → REJECTED（プラン A では到達させない。関数だけ用意）
-   // → 2026-09-30 に 17 節で、/_control/ から到達させることにした（PR A）
+   // → 2026-09-30 に 17 節で、/_control/ から到達させることにした（PR A で
+   //   POST /_control/orders/:order_id/reject として入れた）
 ```
 
 **`feeRate` は `placeOrder` / `fillOrder` の末尾にある省略可能な引数**で、既定は

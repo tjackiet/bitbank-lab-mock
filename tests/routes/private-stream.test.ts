@@ -7,6 +7,7 @@ import type { HeldMessage } from "../../src/stream/hub.ts";
 import { RESET_CLOSE_CODE, RESET_CLOSE_REASON } from "../../src/stream/hub.ts";
 import { buildState } from "../engine/helpers.ts";
 import { connectStream, setupBuildTestServer, streamRecorder } from "./helpers.ts";
+import { OFFICIAL_STREAM_ORDER_STATUSES } from "./official-fields.ts";
 
 const LIMIT_BUY = {
   pair: "btc_jpy",
@@ -112,6 +113,47 @@ describe("GET /_stream/private", () => {
       "onhand_amount",
       "withdrawing_amount",
     ]);
+    ws.terminate();
+  });
+
+  /**
+   * 17.2 の決定 17: `REJECTED` にした注文も、状態の差から作るまま送る（特例を作らない）。
+   * **公式の stream の status の列挙（6 値）に `REJECTED` は無い**ので、公式から外れる値を
+   * 送っていることをここで明示しておく（`docs/fidelity.md` の「private stream の注文ペイロード」節）。
+   */
+  it("POST /_control/orders/:order_id/reject は REJECTED の spot_order と、拘束が外れた asset_update を送る", async () => {
+    const { fastify } = await build(buildState(), {}, { fillMode: "manual", controlEnabled: true });
+    const { ws, ...rec } = await connectStream(fastify);
+    await fastify.inject({ method: "POST", url: "/v1/user/spot/order", payload: LIMIT_BUY });
+    await rec.flush();
+    const placedAsset = rec.take()[1]?.message.params[0];
+    expect(placedAsset).toMatchObject({ asset: "jpy", lockedAmount: "5006.0000" });
+
+    const res = await fastify.inject({ method: "POST", url: "/_control/orders/1/reject" });
+    expect(res.statusCode).toBe(200);
+    await rec.flush();
+    expect(rec.methods()).toEqual(["spot_order", "asset_update"]);
+
+    const order = rec.messages[0]?.message.params[0] as Record<string, unknown>;
+    expect(order.status).toBe("REJECTED");
+    expect(OFFICIAL_STREAM_ORDER_STATUSES).not.toContain(order.status);
+    // 共通部分は同じ時点の GET order と一致する（REST と stream が同じ状態を見せる）。
+    const { executed_at, is_just_triggered, ...rest } = order;
+    expect(executed_at).toBe(0);
+    expect(is_just_triggered).toBe(false);
+    const fetched = await fastify.inject({
+      method: "GET",
+      url: "/v1/user/spot/order?pair=btc_jpy&order_id=1",
+    });
+    expect(rest).toEqual(fetched.json().data);
+
+    // 残高は動かず、拘束だけが外れる。
+    expect(rec.messages[1]?.message.params[0]).toMatchObject({
+      asset: "jpy",
+      lockedAmount: "0.0000",
+      freeAmount: "10000000.0000",
+      onhandAmount: "10000000.0000",
+    });
     ws.terminate();
   });
 
@@ -263,6 +305,31 @@ describe("GET /_stream/private と保留・再送", () => {
     await fastify.inject({ method: "POST", url: "/v1/user/spot/order", payload: LIMIT_BUY });
     await rec.flush();
     expect(rec.methods()).toEqual(["spot_order_new", "asset_update"]);
+    ws.terminate();
+  });
+
+  it("保留中の reject は他の変化と同じく溜まり、release で届く", async () => {
+    const { fastify } = await build(buildState(), {}, { fillMode: "manual", controlEnabled: true });
+    const { ws, ...rec } = await connectStream(fastify);
+    await fastify.inject({ method: "POST", url: "/v1/user/spot/order", payload: LIMIT_BUY });
+    await rec.flush();
+    rec.take();
+
+    await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+    const rejected = await fastify.inject({ method: "POST", url: "/_control/orders/1/reject" });
+    expect(rejected.statusCode).toBe(200);
+    await rec.flush();
+    expect(rec.messages).toEqual([]);
+
+    const held = (await fastify.inject({ method: "GET", url: "/_control/stream/held" })).json()
+      .messages as HeldMessage[];
+    expect(held.map((m) => m.frame.message.method)).toEqual(["spot_order", "asset_update"]);
+    expect(held[0]?.frame.message.params[0]).toMatchObject({ status: "REJECTED" });
+
+    const res = await fastify.inject({ method: "POST", url: "/_control/stream/release" });
+    expect(res.json()).toEqual({ sent: 2, omitted: [], clients: 1 });
+    await rec.flush();
+    expect(rec.messages).toEqual(held.map((m) => m.frame));
     ws.terminate();
   });
 

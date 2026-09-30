@@ -60,6 +60,7 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [control のアクセス境界](#control-のアクセス境界) — 許可判定を TCP の対向アドレスに固定し、`X-Control-Token` はヘッダ行がちょうど 1 本のときだけ受け、一致を `timingSafeEqual` で見る
 - [`/_control/`](#_control) — `GET /_control/state` に状態ファイルへの書き出しの状況（`persist`）を添える
 - [足の取得の健全性](#足の取得の健全性) — `GET /_control/state` に足の取得の状況（`candles`）を添える（取得に失敗しても互換ルートは成功応答のまま。改訂前: 失敗は warn に出るだけで、応答からは見えなかった）
+- [`/_control/`](#_control) / [注文状態](#注文状態) — `POST /_control/orders/:order_id/reject` を足し、`UNFILLED` / `INACTIVE` の注文を `REJECTED` にできるようにした（private stream には `REJECTED` の `spot_order` が流れる。改訂前: `REJECTED` へ到達する口が無く、状態ファイルが最初からその状態を持っていたときだけ現れた）
 
 ### private stream（`/_stream/private`）
 
@@ -170,6 +171,7 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 約定していない注文の `spot_order_new` / `spot_order` で、実 API は `executed_at` に何を返しますか
 - [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 実 API の注文ペイロードの `executed_at` は、最初の約定時刻と最後の約定時刻のどちらですか
 - [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 実 API の `spot_order_new` / `spot_order` は、取り消していない注文や成行注文でも `canceled_at` / `price` のキーを含めますか
+- [private stream の注文ペイロード](#private-stream-の注文ペイロード) — 実 API の private stream は、`REJECTED` になった注文の `spot_order` を送りますか
 - [private stream の順序](#private-stream-の順序) — 実 API の private stream は、同じメッセージを重複して届けることがありますか
 - [private stream の `asset_update` のキー](#private-stream-の-asset_update-のキー) — 実 API の `asset_update` は、キーを snake_case（`free_amount`）と camelCase（`freeAmount`）のどちらで送りますか
 - [private stream の `spot_order_invalidation`](#private-stream-の-spot_order_invalidation) — 実 API の `spot_order_invalidation` の `params` は、オブジェクトと配列のどちらですか
@@ -251,6 +253,8 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 
 `INACTIVE` を含む公式の 7 値を `OrderRecord.status` に持つ。Plan A で `INACTIVE` は到達しない
 
+**`REJECTED` へ到達する経路は `/_control/` の `POST /_control/orders/:order_id/reject` だけである**（`UNFILLED` / `INACTIVE` の注文を `REJECTED` にする。同じ表の「`/_control/`」節）。互換ルートの発注・取消は `REJECTED` を作らない——実 API がどの条件で注文を拒否するかを公式は書いておらず、模す条件が無いためである。`REJECTED` にした注文は `GET order` / `orders_info` の照会と private stream の `spot_order`（同じ表の「private stream の注文ペイロード」節）に現れ、`active_orders` には出ない。取り消そうとすると `50009` が返る（同じ表の「取消済み・約定済みの取消」節）。状態ファイルが最初から `REJECTED` を持っていた場合も同じに扱う
+
 **状態の集合は公式文書の中で揺れている。** 固定コミット `0badd680` の status enum を REST の 3 節と private stream の 1 節 × 2 言語で比べると、`REJECTED` を含む節と含まない節が言語版ごとに食い違う。
 
 | 節 | 英語版 | 日本語版 |
@@ -267,12 +271,12 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 **実装から到達可能な status と、公式の各節の列挙は別の話なので混同しない。** モックが `OrderRecord.status` に 7 値を持つのは状態モデルの話で、経路ごとに返し得る集合は別に写してある（`tests/routes/official-fields.ts` の `OFFICIAL_FETCH_ORDER_STATUSES` / `OFFICIAL_CREATE_ORDER_STATUSES` / `OFFICIAL_CANCEL_ORDER_STATUSES` が節ごとに 3 つの定数に分けている。広い方の 7 値で全経路を検査すると、`REJECTED` を返してはいけない経路で素通りするため）。
 
 - **根拠**: REST API と private stream の status enum（上の表の 8 箇所）。**`REJECTED` の存在は英日の両方に根拠がある**（`rest-api.md:310` と `rest-api_JP.md:409`）
-- **本物との差異**: 逆指値等は未実装。**各節が列挙する集合の完全性は公式文書内で揺れている**（上の表。REST 6 箇所 + private stream 2 箇所のうち、`REJECTED` を列挙するのは 2 箇所だけ）。本モックは `REJECTED` を状態モデルに持ち、`/_control/` から到達させられる
+- **本物との差異**: 逆指値等は未実装。**各節が列挙する集合の完全性は公式文書内で揺れている**（上の表。REST 6 箇所 + private stream 2 箇所のうち、`REJECTED` を列挙するのは 2 箇所だけ）。本モックは `REJECTED` を状態モデルに持ち、`/_control/` の `POST /_control/orders/:order_id/reject` からだけ到達させられる（互換ルートからは到達しない。実 API で注文が `REJECTED` になる条件は模していない）
 - **推測**: いいえ（7 値の顔ぶれと `REJECTED` の存在は公式が定義する）。**ただし留保がある**——「どの経路がどの状態を返し得るか」の公式の列挙は節ごとに食い違うので、**節の列挙の完全性を根拠に使えない**。どちらの言語版が正かは実測していない
   - 確認先 **実 API**: 実 API の Fetch order information（`GET order`）は、`REJECTED` を返すことがありますか
   - 確認先 **実 API**: 実 API の Create new order（`POST order`）の応答は、`REJECTED` を返すことがありますか
   - 確認先 **実 API**: 実 API の Cancel order の応答は、`REJECTED` を返すことがありますか
-- **利用側への含意**: 終端状態の不変性を検証対象にする。**`REJECTED` を「英語版にしか無い状態」と扱わないこと**（日本語版の Create new order にもある）。経路ごとに返り得る状態を公式の 1 節だけから決め打たず、7 値すべてを受けられるパーサにしておくのが安全側である
+- **利用側への含意**: 終端状態の不変性を検証対象にする。**`REJECTED` を「英語版にしか無い状態」と扱わないこと**（日本語版の Create new order にもある）。経路ごとに返り得る状態を公式の 1 節だけから決め打たず、7 値すべてを受けられるパーサにしておくのが安全側である。`REJECTED` を終端として扱う経路（照会・stream・取消）は、`POST /_control/orders/:order_id/reject` で踏める
 
 ### 注文 ID
 
@@ -718,12 +722,15 @@ Plan A は認証ヘッダを検証しない。private stream の WebSocket（`/_
 
 ### `/_control/`
 
-`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`POST /_control/stream/hold`・`GET /_control/stream/held`・`POST /_control/stream/release`（private stream の保留・再送。同じ表の「private stream の保留・再送」節）、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。保留・再送の 3 つは状態ファイルに書かないので劣化中も通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
+`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/orders/:id/reject`（`UNFILLED` / `INACTIVE` の注文を `REJECTED` にする。下の段落）、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`POST /_control/stream/hold`・`GET /_control/stream/held`・`POST /_control/stream/release`（private stream の保留・再送。同じ表の「private stream の保留・再送」節）、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。保留・再送の 3 つは状態ファイルに書かないので劣化中も通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
+
+**`reject` は `fill` と対になる口である。** 本文は読まず、`UNFILLED` / `INACTIVE` の注文を `REJECTED` にして、`{ "order": … }` を返す（`order` は `fill` の応答の `order` と同じ形で、値は同じ時点の `GET order` と同じ。約定は起きないので `trade` は持たない）。存在しない注文は 404 `{"error":"ORDER_NOT_FOUND"}`、それ以外の状態は 409 `{"error":"ORDER_NOT_ACTIVE","status":…}` で、どちらも状態を変えない。**部分約定済みの注文を断るのは不変量 2**（`REJECTED` の約定量は 0。下の「6 本の不変量」）のためで、約定した分を残して止めたいなら取消（`CANCELED_PARTIALLY_FILLED`）を使う。残高は動かさず、拘束だけが外れる（拘束は active な注文から計算する）。取消ではないので `canceled_at` は埋めず、拒否した時刻は REST の応答に出ない。private stream には `REJECTED` の `spot_order` と、拘束が外れた資産の `asset_update` が流れる（保留中なら他のメッセージと同じく溜まる。同じ表の「private stream の注文ペイロード」節）
 
 - **根拠**: 本モック固有
 - **本物との差異**: bitbank API に存在しない
 - **推測**: はい
   - 確認先 **モックの設計判断**: 実験用の口の形と応答（素の JSON と HTTP ステータス）
+  - 確認先 **モックの設計判断**: `reject` が受ける状態を `UNFILLED` / `INACTIVE` に限り（部分約定済みは不変量 2 のため断る）、`fill` と同じ形の `order` を返すこと
 - **利用側への含意**: 利用側 / 本番 API の仕様に control の存在を混入させない
 
 ### control のアクセス境界
@@ -758,7 +765,7 @@ control 有効時の既定は `BITBANK_MOCK_FILL_MODE=manual`。`store.tick()` �
 
 ### control の fill / tick 検証
 
-存在しない注文 404、終端 409。`POST /_control/tick` の `pair` は互換ルートと同じ検証（`pairAssets`）を通らなければ 400 `INVALID_PAIR`。`amount` が非正・残量超過・桁溢れは 400 `INVALID_AMOUNT`。`price` が非正・非有限は 400 `INVALID_PRICE`。足は `0 < low <= open <= high` かつ `low <= close <= high` の有限値で、`timestamp` は `Date` の表現範囲から下流の加算分を引いた範囲（`-8.64e15 <= t <= 8.64e15 − 9 時間`。上側だけ JST オフセット分の余裕を取るので非対称）に収まること。さらに `timestamp` が `現在時刻 + 24 時間` を超えるものは 400 `CANDLE_TOO_FAR_AHEAD`、60 秒の単調前進だけでその幅を超える tick は 400 `CLOCK_TOO_FAR_AHEAD`（同じ表の「control の時計」節）。`POST /_control/clock` の `lastTickAt` は ISO 文字列かエポックミリ秒で、同じ 2 つの範囲を外れると 400 `INVALID_CLOCK` / 400 `CLOCK_TOO_FAR_AHEAD`。`POST /_control/reset` の `balances` のキーは互換ルートと同じ文字種（`[a-z0-9]+`、`pairAssets` のセグメント）に限り、外れるものは 400 `INVALID_BALANCES`。**値と `initialJpy` は有限の非負数で、`0` は通す**（負・非有限・数値でないものは 400 `INVALID_BALANCES`）——残高 0 から始めて発注が残高不足で断られることを確かめる筋を塞がないため。`fill` / `tick` の非正が断られる側であるのに対し、ここだけ `0` が**受け入れる側**である。拒否時は状態を変えない（`fill` / `tick` / `clock` / `reset` の全拒否経路で確認済み）
+存在しない注文 404、終端 409。`POST /_control/tick` の `pair` は互換ルートと同じ検証（`pairAssets`）を通らなければ 400 `INVALID_PAIR`。`amount` が非正・残量超過・桁溢れは 400 `INVALID_AMOUNT`。`price` が非正・非有限は 400 `INVALID_PRICE`。足は `0 < low <= open <= high` かつ `low <= close <= high` の有限値で、`timestamp` は `Date` の表現範囲から下流の加算分を引いた範囲（`-8.64e15 <= t <= 8.64e15 − 9 時間`。上側だけ JST オフセット分の余裕を取るので非対称）に収まること。さらに `timestamp` が `現在時刻 + 24 時間` を超えるものは 400 `CANDLE_TOO_FAR_AHEAD`、60 秒の単調前進だけでその幅を超える tick は 400 `CLOCK_TOO_FAR_AHEAD`（同じ表の「control の時計」節）。`POST /_control/clock` の `lastTickAt` は ISO 文字列かエポックミリ秒で、同じ 2 つの範囲を外れると 400 `INVALID_CLOCK` / 400 `CLOCK_TOO_FAR_AHEAD`。`POST /_control/reset` の `balances` のキーは互換ルートと同じ文字種（`[a-z0-9]+`、`pairAssets` のセグメント）に限り、外れるものは 400 `INVALID_BALANCES`。**値と `initialJpy` は有限の非負数で、`0` は通す**（負・非有限・数値でないものは 400 `INVALID_BALANCES`）——残高 0 から始めて発注が残高不足で断られることを確かめる筋を塞がないため。`fill` / `tick` の非正が断られる側であるのに対し、ここだけ `0` が**受け入れる側**である。拒否時は状態を変えない（`fill` / `reject` / `tick` / `clock` / `reset` の全拒否経路で確認済み。`reject` の断り方は同じ表の「`/_control/`」節）
 
 - **根拠**: 本モック固有（不変量 1 の防御）
 - **本物との差異**: 本物には無い
@@ -896,18 +903,22 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 **どの行も、モックの値は英日のどちらかの stream の表と REST の表に合っている**（`remaining_amount` / `start_amount` は両方に合う）。どちらかの言語版を正に選んだのではなく、REST から変えていないだけである。**`executed_at` だけは英日とも `number`（`private-stream.md:120` / `private-stream_JP.md:121`）で食い違いが無い**ので、キーを省かない
 
+**`REJECTED` の注文も `spot_order` で送る。** `POST /_control/orders/:order_id/reject` で `REJECTED` にした注文は、状態の差から作るまま `status: "REJECTED"` の `spot_order` が 1 通と、拘束が外れた資産の `asset_update` が届く（保留中なら他のメッセージと同じく溜まる）。**公式の stream の `status` の列挙は英日とも 6 値で、`REJECTED` を含まない**（`private-stream.md:130` / `private-stream_JP.md:131`。上の「注文状態」節の表）ので、公式の列挙に無い値を送っていることになる。送らないには `src/stream/events.ts` に status を見て落とす特例が要り、照会には `REJECTED` が出るのに stream は黙る食い違いになるので、送るほうを採った（計画書 17.2 の決定 17）。`spot_order_invalidation` では送らない（下の同名の節）
+
 - **根拠**: 公式のフィールド表（`private-stream.md:115-136` / `private-stream_JP.md:116-137`）と、上の表の REST の行。`spot_order` は「内容は `spot_order_new` と同一」（`private-stream.md:176` / `private-stream_JP.md:177`）。**`spot_order_new` の節の注記は、`FULLY_FILLED` / `CANCELED_*` の通知を受けたら手元の注文情報から消すよう書いており**（`private-stream.md:113` / `private-stream_JP.md:113`）、新規の通知が既に終端の状態で届くことを公式も想定している
-- **本物との差異**: **約定の無い注文の `executed_at` の値（`0`）は応答例の値に合わせただけ**で、実 API が何を返すかは確かめていない。**「どの約定の時刻か」も公式は書いていない**（説明は "order executed at unix timestamp (milliseconds)" だけ）。**`is_just_triggered` はモックに逆指値のトリガという概念が無いので常に偽**（「たった今トリガされた」注文が存在しない）。成行で `UNFILLED` の `spot_order_new` を挟むかは確かめていない。上の表の 5 行は、実 API がどちらの言語版どおりに送るか確かめていない。`status` の enum（`private-stream.md:130`）は `REJECTED` を含まない 6 値で、互換ルートと `/_control/` から `REJECTED` へ到達する経路は無い（上の「注文状態」節）
+- **本物との差異**: **約定の無い注文の `executed_at` の値（`0`）は応答例の値に合わせただけ**で、実 API が何を返すかは確かめていない。**「どの約定の時刻か」も公式は書いていない**（説明は "order executed at unix timestamp (milliseconds)" だけ）。**`is_just_triggered` はモックに逆指値のトリガという概念が無いので常に偽**（「たった今トリガされた」注文が存在しない）。成行で `UNFILLED` の `spot_order_new` を挟むかは確かめていない。上の表の 5 行は、実 API がどちらの言語版どおりに送るか確かめていない。**`status` の enum（`private-stream.md:130` / `private-stream_JP.md:131`）は `REJECTED` を含まない 6 値だが、モックは `REJECTED` も送る**（上の段落。`REJECTED` へ到達するのは `/_control/` からだけで、上の「注文状態」節）。実 API の private stream が `REJECTED` を送るかは確かめていない
 - **推測**: はい
   - 確認先 **実 API**: 約定していない注文の `spot_order_new` / `spot_order` で、実 API は `executed_at` に何を返しますか
   - 確認先 **実 API**: 実 API の注文ペイロードの `executed_at` は、最初の約定時刻と最後の約定時刻のどちらですか
   - 確認先 **実 API**: 実 API で成行注文を出したとき、`spot_order_new` は `status` が `FULLY_FILLED` の 1 通だけで届きますか
   - 確認先 **実 API**: 実 API の `spot_order_new` / `spot_order` は、取り消していない注文や成行注文でも `canceled_at` / `price` のキーを含めますか
-- **利用側への含意**: 注文の追跡は、`spot_order_new` が必ず `UNFILLED` で始まることを前提にしない（公式の注記どおり、終端の状態で届き得る）。**`executed_at` を約定の判定に使わない**（約定が無くても `0` が入る）——`executed_amount` と `status` で判定する。`canceled_at` / `price` のキーの有無、`expire_at` の `null` にも依存しない（英日の表で扱いが割れている）
+  - 確認先 **実 API**: 実 API の private stream は、`REJECTED` になった注文の `spot_order` を送りますか
+  - 確認先 **モックの設計判断**: `REJECTED` にした注文を、公式の stream の列挙（6 値）に無い値のまま `spot_order` で送ること（計画書 17.2 の決定 17）
+- **利用側への含意**: 注文の追跡は、`spot_order_new` が必ず `UNFILLED` で始まることを前提にしない（公式の注記どおり、終端の状態で届き得る）。**`executed_at` を約定の判定に使わない**（約定が無くても `0` が入る）——`executed_amount` と `status` で判定する。`canceled_at` / `price` のキーの有無、`expire_at` の `null` にも依存しない（英日の表で扱いが割れている）。**`status` が公式の 6 値の外（`REJECTED`）でも落ちないパーサにする**。本番の stream が `REJECTED` を送らない可能性もあるので、`REJECTED` の検知を stream だけに頼らず、REST の照合（`orders_info`）でも拾えるようにしておく
 
 ### private stream の発火契機
 
-**状態が変わるたびに、その変化を送る**（`/_control/stream/hold` で保留している間は送らずに溜める。下の「private stream の保留・再送」節）。送る内容は変化の前後の状態の差から作るので（`src/stream/events.ts`）、経路を問わない——互換ルートの発注・取消・一括取消、`/_control/` の fill / tick、**market モードの `tick()` が埋めた約定**のどれでも同じように流れる。**market モードでは読み取りの要求（`GET /v1/user/assets` など）が約定を起こし、そのイベントが流れる**。足による自動の約定を起こすのは `store.tick()` を通る互換ルートで、**`GET /v1/user/subscribe` だけは例外**である（状態を読まないので tick を通らない。上の「private stream」節）。control を有効にしていれば、`/_control/` の fill / tick も market モードのまま約定を起こし、同じようにイベントが流れる。裏で足を見張る仕組みは無いので、**互換ルートにも `/_control/` にも要求が来ない間は約定もイベントも起きない**。manual モードでは、互換ルートの状態を変える要求と `/_control/` の操作でだけ流れる。時計だけを動かす変化（`POST /_control/clock`、tick の末尾の時計の前進）は何も流さない
+**状態が変わるたびに、その変化を送る**（`/_control/stream/hold` で保留している間は送らずに溜める。下の「private stream の保留・再送」節）。送る内容は変化の前後の状態の差から作るので（`src/stream/events.ts`）、経路を問わない——互換ルートの発注・取消・一括取消、`/_control/` の fill / reject / tick、**market モードの `tick()` が埋めた約定**のどれでも同じように流れる。**market モードでは読み取りの要求（`GET /v1/user/assets` など）が約定を起こし、そのイベントが流れる**。足による自動の約定を起こすのは `store.tick()` を通る互換ルートで、**`GET /v1/user/subscribe` だけは例外**である（状態を読まないので tick を通らない。上の「private stream」節）。control を有効にしていれば、`/_control/` の fill / tick も market モードのまま約定を起こし、同じようにイベントが流れる。裏で足を見張る仕組みは無いので、**互換ルートにも `/_control/` にも要求が来ない間は約定もイベントも起きない**。manual モードでは、互換ルートの状態を変える要求と `/_control/` の操作でだけ流れる。時計だけを動かす変化（`POST /_control/clock`、tick の末尾の時計の前進）は何も流さない
 
 - **根拠**: 本モック固有（計画書 16 節の決定 13）。公式の約定は市場が動いたときに起き、利用者の要求とは無関係に通知される
 - **本物との差異**: **発火の契機がモック固有**——本物は市場が動いたときに飛ぶが、market モードのモックは「誰かが互換ルート（`GET /v1/user/subscribe` を除く）か `/_control/` の fill / tick を叩いたとき」に飛ぶ。manual モードでは約定は `/_control/` を叩いた時点でだけ起きる
@@ -1022,7 +1033,7 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 **1 つだけ前提が崩れる経路がある。** v1 / v2 から移行してきた状態ファイルが不変量 6 を破っている場合は、起動を止めず warn を出すだけである（同じく下の「不変量を破る状態ファイル」節）。そのときアクティブ注文の資産は実際には確保されていない。**ただしそれでも invalidation にはならない**——`fillOrder()` は残高の検査を 1 つも持たず無条件に引き落とすので、起きるのは**残高が負になること**であって「資産不足で注文を無効にする」経路ではない。**本モックに約定時の資産不足を検出する箇所は存在しない**
 
-**`rejectOrder()` を流用しない。** 名前が近いので結び付けたくなるが、`REJECTED` は注文ステータスであって「無効化されたから通知する」という意味ではなく、**本番経路から呼ばれてもいない**（`/_control/` から到達させるためだけに用意してある。上の「注文状態」節）。意味の違う 2 つを 1 つにすると、利用側が学習する契約が壊れる
+**`rejectOrder()` を流用しない。** 名前が近いので結び付けたくなるが、`REJECTED` は注文ステータスであって「無効化されたから通知する」という意味ではなく、**互換ルートからは呼ばれない**（呼び出し元は `/_control/` の `POST /_control/orders/:order_id/reject` だけ。上の「注文状態」節）。そこで `REJECTED` にした注文は `spot_order`（`status: "REJECTED"`）で届き、このメソッドでは送らない（上の「private stream の注文ペイロード」節）。意味の違う 2 つを 1 つにすると、利用側が学習する契約が壊れる
 
 - **根拠**: 公式 private stream の `spot_order_invalidation` 節（上の表の 4 箇所と、本文の注記 英 216-223 / 日 217-223）。**固定コミット `0badd680` で確認**
 - **本物との差異**: **このメソッドを一切送らない。** 未実装は非目標であって欠陥ではないという既存の扱いに乗せる（上記のとおり、発生条件が構造的に起こり得ないため模す対象が無い）。**実 API が実際にどの形で送るかは実測していない**（受信には実弾の口座が要る）
@@ -1124,7 +1135,7 @@ engine の関数を直接呼ぶ経路では桁が検査されない。**現状�
 
 | 層 | 場所 | いつ走るか |
 | --- | --- | --- |
-| 生成 | `src/engine/transitions.ts`（`placeOrder` / `fillOrder` / `cancelOrder` / `rejectOrder`）と `src/engine/match.ts` | 常時。注文・約定・残高を変える唯一の経路（`rejectOrder` は本番経路から呼ばれておらず、テストからのみ到達する）。`SessionStore.tick()` は market モードでこの層（`runTick()` → `fillOrder()`）を通して注文・約定・残高・`nextTradeSeq` を変え、そのうえで `lastTickAt` / `updatedAt` を実時刻へ上書きする（manual モードは早期 return で何も変えない）。この層を通さずに `PaperState` を差し替えるのは `POST /_control/reset`（全レコードを捨てて作り直す）と `POST /_control/clock`（`lastTickAt` / `updatedAt` だけ）である |
+| 生成 | `src/engine/transitions.ts`（`placeOrder` / `fillOrder` / `cancelOrder` / `rejectOrder`）と `src/engine/match.ts` | 常時。注文・約定・残高を変える唯一の経路（`rejectOrder` の呼び出し元は `/_control/` の `POST /_control/orders/:order_id/reject` だけで、互換ルートからは到達しない）。`SessionStore.tick()` は market モードでこの層（`runTick()` → `fillOrder()`）を通して注文・約定・残高・`nextTradeSeq` を変え、そのうえで `lastTickAt` / `updatedAt` を実時刻へ上書きする（manual モードは早期 return で何も変えない）。この層を通さずに `PaperState` を差し替えるのは `POST /_control/reset`（全レコードを捨てて作り直す）と `POST /_control/clock`（`lastTickAt` / `updatedAt` だけ）である |
 | 読み込み時の検査 | `src/engine/persist.ts` の `loadState()` | 起動時に状態ファイルを読み、v3 へ移行した直後に 1 回。不変量の前提（`preconditionViolations()`）を先に、続けて不変量（`invariantViolations()`）を見る。違反があれば起動しない（v1 / v2 からの移行だけは warn で通す）。前提が破れて落とすときは不変量の違反を並べない。`invariantViolations()` の文字列は注文を id で指すので、id が重複した状態ではどのレコードの話か定まらないため |
 | テスト | `tests/engine/invariants.test.ts` | `npm test`。fast-check のランダム操作列 40 本 × 各操作の後。操作は `btc_jpy` の**指値**の発注・約定・取消・拒否だけで、手数料率は 0、数量は `0.001`〜`0.006` と `8192.0011`〜`8192.006`（約 1/3 が大きい側。クランプの境界を跨ぐため）。約定は半分の確率で部分約定済みの注文から選ぶ（クランプは「部分約定のあとに残量ちょうどを約定させる」経路でしか踏まないため）。これとは別に、`8192`〜`16383` の `startAmount` を部分約定 → 全約定させる性質を 500 本回す。成行・`runTick()`・移行・`/_control/` の各口・複数ペア・重複 id は含まない。同じ操作列で不変量の前提（`preconditionViolations()`）も各操作の後に検査する（遷移関数からは重複 id を作れないことの確認であり、重複した状態を操作列が作るわけではない） |
 

@@ -72,6 +72,7 @@
 | 失敗の見え方（error code と封筒） | **一部** | 互換ルートは封筒、`/_control/` は素の JSON | [エラーコード](fidelity.md#エラーコード) / [封筒に包まれない応答](fidelity.md#封筒に包まれない応答) / [配列の包み方](fidelity.md#配列の包み方) |
 | 注文・約定・残高の変化の push 受信 | **一部** | `GET /_stream/private`（WebSocket）と `GET /v1/user/subscribe` | [private stream](fidelity.md#private-stream) / [private stream のメッセージ](fidelity.md#private-stream-のメッセージ) / [private stream の発火契機](fidelity.md#private-stream-の発火契機) |
 | push の順序の入れ替わり・重複・欠落を起こす手段 | 対応 | `POST /_control/stream/hold` / `GET /_control/stream/held` / `POST /_control/stream/release` | [private stream の順序](fidelity.md#private-stream-の順序) / [private stream の保留・再送](fidelity.md#private-stream-の保留再送) |
+| 注文を `REJECTED` にする手段 | 対応 | `POST /_control/orders/:order_id/reject` | [注文状態](fidelity.md#注文状態) / [`/_control/`](fidelity.md#_control) / [private stream の注文ペイロード](fidelity.md#private-stream-の注文ペイロード) |
 
 「**一部**」と書いたものは、対応してはいるが**範囲に条件が付く**もの。条件そのものは上の節で読む。
 

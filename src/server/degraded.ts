@@ -47,6 +47,7 @@ export const MUTATING_ROUTES: ReadonlySet<string> = new Set([
   "POST /_control/tick",
   "POST /_control/clock",
   "POST /_control/orders/:order_id/fill",
+  "POST /_control/orders/:order_id/reject",
 ]);
 
 /**
