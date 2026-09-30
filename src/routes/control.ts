@@ -94,6 +94,24 @@ function syntheticCandle(price: number, timestamp: number): Candle {
 }
 
 /**
+ * `POST /_control/stream/release` の本文から `order` を取り出す。本文の省略・`{}`・`order` の
+ * 省略は `undefined`（溜めた順にすべて送る）。形が違えば `null`（400 で断る）。
+ *
+ * ここで見るのは**形だけ**（オブジェクトで、`order` が数値の配列）。整数か・溜めた番号の範囲に
+ * 収まるか・長すぎないかは溜めた数を知っている hub が見る（`PrivateStreamHub.release()`）。
+ * 文字列の `"1"` は数へ強制しない——番号を打ち間違えたまま別のメッセージを送らないため。
+ */
+function releaseOrder(body: unknown): number[] | undefined | null {
+  if (body === undefined) return undefined;
+  const record = asRecord(body);
+  if (!record) return null;
+  const order = record.order;
+  if (order === undefined) return undefined;
+  if (!Array.isArray(order) || !order.every((x) => typeof x === "number")) return null;
+  return order;
+}
+
+/**
  * `/_control/` の実験用ルート群。bitbank API には存在しないので、応答は bitbank 封筒に
  * 包まず素の JSON で返し、失敗は HTTP ステータス（400 / 403 / 404 / 409。状態ファイルへの
  * 書き出しに失敗した後は状態を変える口が 503）で表す。
@@ -341,5 +359,53 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
       order: formatOrder(r.data.order),
       trade: r.data.trade ? formatTrade(r.data.trade) : null,
     };
+  });
+
+  /*
+   * private stream の保留・再送。公式が保証しない順序の入れ替わり・重複・欠落を、利用側が
+   * 狙ったとおりに起こすための口（`docs/fidelity.md` の「private stream の保留・再送」節）。
+   * 中身は hub のメモリにあり、`PaperState` にも状態ファイルにも入らない。そのため劣化中も
+   * 通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。
+   */
+
+  /**
+   * 保留を始める。以後の変化のメッセージは送らずに溜める（購読者が 0 人でも溜める）。
+   * 既に保留中なら何もしない（溜めたものは捨てない）。本文は読まない。
+   */
+  fastify.post("/stream/hold", async () => fastify.privateStream.hold());
+
+  /** 保留の状況と、溜めたメッセージを溜めた順に番号（`seq`、1 から）付きで返す。 */
+  fastify.get("/stream/held", async () => ({
+    ...fastify.privateStream.holdStatus(),
+    messages: fastify.privateStream.heldMessages(),
+  }));
+
+  /**
+   * 溜めたものを `order` の番号の順に、その時点で接続している全員へ送り、保留を解く。
+   * 同じ番号を 2 度書けば重複、書かなかった番号は欠落。`order` を省略したら溜めた順にすべて。
+   *
+   * - 保留していない: 409 `NOT_HOLDING`
+   * - 上限に達して落とした変化がある: 409 `STREAM_HOLD_OVERFLOWED`（保留は解かない。抜け出すのは
+   *   `POST /_control/reset`）
+   * - `order` の形・範囲・長さが違う: 400 `INVALID_RELEASE_ORDER`
+   *
+   * 断ったときは保留も溜めたものもそのまま残す。
+   */
+  fastify.post("/stream/release", async (request, reply) => {
+    const hub = fastify.privateStream;
+    const order = releaseOrder(request.body);
+    const invalid = () => {
+      const { held, limit } = hub.holdStatus();
+      return reply.code(400).send({ error: "INVALID_RELEASE_ORDER", held, limit });
+    };
+    if (order === null) return invalid();
+    const r = hub.release(order);
+    if (r.success) return r.data;
+    if (r.error === "NOT_HOLDING") return reply.code(409).send({ error: "NOT_HOLDING" });
+    if (r.error === "OVERFLOWED") {
+      const { limit, dropped } = hub.holdStatus();
+      return reply.code(409).send({ error: "STREAM_HOLD_OVERFLOWED", limit, dropped });
+    }
+    return invalid();
   });
 };

@@ -9,6 +9,8 @@ import type { PersistFailureMode } from "../../src/server/degraded.ts";
 import {
   assertRouteClassified,
   MUTATING_ROUTES,
+  NON_PERSISTING_CONTROL_ROUTES,
+  passesWhileDegraded,
   READ_ROUTES,
   routeKey,
 } from "../../src/server/degraded.ts";
@@ -215,6 +217,45 @@ describe("劣化モード（persist に失敗した後）", () => {
     }
   });
 
+  /**
+   * 状態ファイルに書かない control の口（private stream の保留・再送）は劣化中も通す。
+   * 劣化の前に溜めたもの——劣化の引き金になった `70001` の要求のイベントも含む——を
+   * 取り出せないと、復帰の手順（再起動）でその回の stream の実験が消えるため。
+   */
+  it("劣化中も hold / held / release は通り、劣化の引き金になった要求のイベントも取り出せる", async () => {
+    const { fastify, store, close } = await buildDegradable({ state: buildState() });
+    try {
+      const stream = await connectStream(fastify);
+      const hold = await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+      expect(hold.statusCode).toBe(200);
+
+      // この発注の書き出しが失敗して劣化する。応答は 70001 だが、メモリと保留には残る。
+      const order = await fastify.inject({
+        method: "POST",
+        url: "/v1/user/spot/order",
+        payload: { pair: "btc_jpy", side: "buy", type: "limit", price: 5_000_000, amount: 0.001 },
+      });
+      expect(order.json()).toEqual({ success: 0, data: { code: 70001 } });
+      expect(store.isDegraded()).toBe(true);
+
+      const held = await fastify.inject({ method: "GET", url: "/_control/stream/held" });
+      expect(held.statusCode).toBe(200);
+      expect(held.json().held).toBe(2);
+      // 劣化してから保留し直しても（既に保留中なので何もしないが）断られない。
+      const again = await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+      expect(again.statusCode).toBe(200);
+
+      const release = await fastify.inject({ method: "POST", url: "/_control/stream/release" });
+      expect(release.statusCode).toBe(200);
+      expect(release.json()).toEqual({ sent: 2, omitted: [], clients: 1 });
+      await stream.flush();
+      expect(stream.methods()).toEqual(["spot_order_new", "asset_update"]);
+      stream.ws.terminate();
+    } finally {
+      await close();
+    }
+  });
+
   it("劣化中に読み出した /_control/state を書き戻して読み込める（復帰手順）", async () => {
     const { fastify, store, close } = await buildDegradable();
     try {
@@ -384,6 +425,20 @@ describe("経路の分類", () => {
   it("POST /v1/user/spot/orders_info は読み取りとして分類されている", () => {
     expect(READ_ROUTES.has("POST /v1/user/spot/orders_info")).toBe(true);
     expect(MUTATING_ROUTES.has("POST /v1/user/spot/orders_info")).toBe(false);
+  });
+
+  it("状態ファイルに書かない control の口は /_control/ だけで、他の 2 つと重ならず、劣化中も通す", () => {
+    expect(NON_PERSISTING_CONTROL_ROUTES.size).toBeGreaterThan(0);
+    for (const key of NON_PERSISTING_CONTROL_ROUTES) {
+      expect(key).toMatch(/^[A-Z]+ \/_control\//);
+      expect(READ_ROUTES.has(key)).toBe(false);
+      expect(MUTATING_ROUTES.has(key)).toBe(false);
+      const [method, url] = key.split(" ") as [string, string];
+      expect(passesWhileDegraded(method, url)).toBe(true);
+      expect(() => assertRouteClassified(method, url)).not.toThrow();
+    }
+    expect(passesWhileDegraded("GET", "/v1/user/assets")).toBe(true);
+    expect(passesWhileDegraded("POST", "/_control/reset")).toBe(false);
   });
 
   it("分類済みの経路は通り、未分類は throw する", () => {

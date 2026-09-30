@@ -8,6 +8,8 @@ import { activeOrders } from "../../src/engine/state.ts";
 import { controlRoutes, controlTokenHeader } from "../../src/routes/control.ts";
 import { buildServer } from "../../src/server/http.ts";
 import { SessionStore } from "../../src/store/session.ts";
+import type { PrivateStreamMessage } from "../../src/stream/events.ts";
+import { DEFAULT_HOLD_LIMIT } from "../../src/stream/hub.ts";
 import { buildOrder, buildState, buildTrade } from "../engine/helpers.ts";
 
 /** src/routes/control.ts の `MAX_CLOCK_AHEAD_MS` と同じ値（実装は export していない）。 */
@@ -18,7 +20,7 @@ async function buildControl(
     balances: { jpy: 10_000_000 },
     orders: [buildOrder({ id: "1", price: 5_000_000, startAmount: 0.001 })],
   }),
-  opts: { token?: string; controlEnabled?: boolean } = {},
+  opts: { token?: string; controlEnabled?: boolean; streamHoldLimit?: number } = {},
 ) {
   const store = new SessionStore(state, { path: null, fillMode: "manual" });
   const fastify = await buildServer({
@@ -26,6 +28,7 @@ async function buildControl(
     logger: false,
     controlEnabled: opts.controlEnabled ?? true,
     controlToken: opts.token,
+    streamHoldLimit: opts.streamHoldLimit,
   });
   return { fastify, store };
 }
@@ -878,6 +881,214 @@ describe("/_control routes", () => {
     expect(body.orders).toEqual([]);
     expect(body.balances).toEqual({ jpy: 50_000, btc: 1 });
     expect(body.initialJpy).toBe(50_000);
+  });
+});
+
+/**
+ * private stream の保留・再送の口。WebSocket を通した見え方は
+ * `tests/routes/private-stream.test.ts`、溜め方そのものは `tests/stream/hub.test.ts` が見る。
+ * ここでは HTTP の形（本文・ステータス・検証）を、hub に直接足した購読者で確かめる。
+ */
+describe("/_control/stream", () => {
+  const cleanups: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    for (const fn of cleanups.splice(0)) await fn();
+  });
+
+  const LIMIT_BUY = {
+    pair: "btc_jpy",
+    side: "buy",
+    type: "limit",
+    price: 5_000_000,
+    amount: 0.001,
+  } as const;
+
+  async function setup(opts: Parameters<typeof buildControl>[1] = {}) {
+    const r = await buildControl(buildState({ balances: { jpy: 10_000_000 } }), opts);
+    cleanups.push(async () => {
+      await r.fastify.close();
+    });
+    const sent: PrivateStreamMessage[] = [];
+    r.fastify.privateStream.addClient({
+      send: (text) => sent.push(JSON.parse(text)),
+      close: () => {},
+    });
+    const order = () =>
+      r.fastify.inject({ method: "POST", url: "/v1/user/spot/order", payload: LIMIT_BUY });
+    const held = async () =>
+      (await r.fastify.inject({ method: "GET", url: "/_control/stream/held" })).json();
+    return { ...r, sent, order, held };
+  }
+
+  it("hold の後の変化は届かず、held に番号付きで溜まり、release で届く", async () => {
+    const { fastify, sent, order, held } = await setup();
+    const hold = await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+    expect(hold.statusCode).toBe(200);
+    expect(hold.json()).toEqual({
+      holding: true,
+      held: 0,
+      limit: DEFAULT_HOLD_LIMIT,
+      overflowed: false,
+      dropped: 0,
+    });
+
+    await order();
+    expect(sent).toEqual([]);
+    const body = await held();
+    expect(body).toMatchObject({ holding: true, held: 2, overflowed: false, dropped: 0 });
+    expect(body.messages.map((m: { seq: number }) => m.seq)).toEqual([1, 2]);
+    expect(
+      body.messages.map((m: { frame: PrivateStreamMessage }) => m.frame.message.method),
+    ).toEqual(["spot_order_new", "asset_update"]);
+
+    const release = await fastify.inject({
+      method: "POST",
+      url: "/_control/stream/release",
+      payload: { order: [2, 1, 2] },
+    });
+    expect(release.statusCode).toBe(200);
+    expect(release.json()).toEqual({ sent: 3, omitted: [], clients: 1 });
+    expect(sent.map((m) => m.message.method)).toEqual([
+      "asset_update",
+      "spot_order_new",
+      "asset_update",
+    ]);
+    expect(await held()).toEqual({
+      holding: false,
+      held: 0,
+      limit: DEFAULT_HOLD_LIMIT,
+      overflowed: false,
+      dropped: 0,
+      messages: [],
+    });
+  });
+
+  it("本文を省略した release と {} の release は溜めた順にすべて送る", async () => {
+    const { fastify, sent, order } = await setup();
+    for (const payload of [undefined, {}]) {
+      sent.splice(0);
+      await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+      await order();
+      const res = await fastify.inject({
+        method: "POST",
+        url: "/_control/stream/release",
+        payload,
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ sent: 2, omitted: [], clients: 1 });
+      expect(sent.map((m) => m.message.method)).toEqual(["spot_order_new", "asset_update"]);
+    }
+  });
+
+  it("保留していないときの release は 409 NOT_HOLDING", async () => {
+    const { fastify } = await setup();
+    const res = await fastify.inject({ method: "POST", url: "/_control/stream/release" });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ error: "NOT_HOLDING" });
+  });
+
+  it.each([
+    { name: "配列の本文", payload: [1] },
+    { name: "order が文字列", payload: { order: "1" } },
+    { name: "order に文字列の番号", payload: { order: ["1"] } },
+    { name: "order が null", payload: { order: null } },
+    { name: "0 番", payload: { order: [0] } },
+    { name: "溜めた数を超える番号", payload: { order: [3] } },
+    { name: "整数でない番号", payload: { order: [1.5] } },
+  ])("$name の release は 400 で断り、保留も溜めたものも残す", async ({ payload }) => {
+    const { fastify, sent, order, held } = await setup();
+    await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+    await order();
+    const before = await held();
+
+    const res = await fastify.inject({ method: "POST", url: "/_control/stream/release", payload });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({
+      error: "INVALID_RELEASE_ORDER",
+      held: 2,
+      limit: DEFAULT_HOLD_LIMIT,
+    });
+    expect(sent).toEqual([]);
+    expect(await held()).toEqual(before);
+  });
+
+  it("上限に達したら溜めずに印と落とした通数を残し、release を 409 で断る。状態を変える要求は断らない", async () => {
+    const { fastify, store, sent, order, held } = await setup({ streamHoldLimit: 3 });
+    await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+    await order(); // 2 通
+    const second = await order(); // 2 通。入りきらない
+    // 発注そのものは通り、状態にも現れる。
+    expect(second.json().success).toBe(1);
+    expect(store.state().orders).toHaveLength(2);
+    const fill = await fastify.inject({ method: "POST", url: "/_control/orders/1/fill" });
+    expect(fill.statusCode).toBe(200);
+
+    const body = await held();
+    expect(body).toMatchObject({ holding: true, held: 2, limit: 3, overflowed: true });
+    expect(body.dropped).toBeGreaterThan(2);
+    expect(body.messages).toHaveLength(2);
+
+    const release = await fastify.inject({ method: "POST", url: "/_control/stream/release" });
+    expect(release.statusCode).toBe(409);
+    expect(release.json()).toEqual({
+      error: "STREAM_HOLD_OVERFLOWED",
+      limit: 3,
+      dropped: body.dropped,
+    });
+    expect(sent).toEqual([]);
+
+    // 抜け出すのは reset。溜めたものを捨て、保留も解く。
+    const reset = await fastify.inject({ method: "POST", url: "/_control/reset", payload: {} });
+    expect(reset.statusCode).toBe(200);
+    expect(await held()).toMatchObject({ holding: false, held: 0, overflowed: false, dropped: 0 });
+  });
+
+  it("reset は溜めたものを捨て、保留を解く", async () => {
+    const { fastify, order, held } = await setup();
+    await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+    await order();
+    await fastify.inject({ method: "POST", url: "/_control/reset", payload: {} });
+    expect(await held()).toMatchObject({ holding: false, held: 0, messages: [] });
+    const res = await fastify.inject({ method: "POST", url: "/_control/stream/release" });
+    expect(res.json()).toEqual({ error: "NOT_HOLDING" });
+  });
+
+  it("保留は PaperState にも GET /_control/state にも現れない", async () => {
+    const { fastify, store } = await setup();
+    const before = store.state();
+    await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+    expect(store.state()).toBe(before);
+    const state = await fastify.inject({ method: "GET", url: "/_control/state" });
+    expect(Object.keys(state.json()).sort()).toEqual(
+      [...Object.keys(before), "persist", "candles"].sort(),
+    );
+  });
+
+  it.each([
+    { method: "POST", url: "/_control/stream/hold" },
+    { method: "GET", url: "/_control/stream/held" },
+    { method: "POST", url: "/_control/stream/release" },
+  ] as const)(
+    "非ループバックからの $method $url はトークンが無ければ 403",
+    async ({ method, url }) => {
+      const { fastify } = await setup({ token: "secret" });
+      const res = await fastify.inject({ method, url, remoteAddress: "10.0.0.8" });
+      expect(res.statusCode).toBe(403);
+      expect(res.json()).toEqual({ error: "FORBIDDEN" });
+      expect(fastify.privateStream.holdStatus().holding).toBe(false);
+    },
+  );
+
+  it("control を無効にすると 3 つとも 404", async () => {
+    const { fastify } = await setup({ controlEnabled: false });
+    for (const [method, url] of [
+      ["POST", "/_control/stream/hold"],
+      ["GET", "/_control/stream/held"],
+      ["POST", "/_control/stream/release"],
+    ] as const) {
+      const res = await fastify.inject({ method, url });
+      expect(res.statusCode).toBe(404);
+    }
   });
 });
 

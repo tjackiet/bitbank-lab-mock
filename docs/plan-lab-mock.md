@@ -1155,7 +1155,10 @@ const dates = new Set<string>([ymdJst(fromMs), ymdJst(toMs)]);
 
 ### 16.4 入れないもの
 
-- **障害注入を外から切り替える口**（16.2）。Plan B（→ 17 節で Plan A へ前倒しした）
+- **障害注入を外から切り替える口**（16.2）。Plan B（→ 17 節で Plan A へ前倒しし、PR B で
+  `/_control/stream/hold` / `held` / `release` の保留・再送として入れた。`DeliveryPolicy` を外から選ぶ口は
+  作っていない——1 回の変化の中しか並べ替えられず、変化をまたいだ入れ替えが作れないため。17.2 の要判断事項 18。
+  挙動は `docs/fidelity.md` の「private stream の保留・再送」節）
 - **`market` モードで裏から足を見張る仕組み**（「誰も叩かなければ届かない」の解消）。外向きの取得の
   頻度が増えるので、15.2 の要判断事項 16（取得頻度）と合わせて決める
 - **`spot_order_invalidation`**（14.1 の (1)）。発生条件が起こり得ない

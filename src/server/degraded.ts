@@ -35,9 +35,9 @@ export const READ_ROUTES: ReadonlySet<string> = new Set([
 /**
  * 劣化中に断る経路。
  *
- * 判定そのものは「読み取りに無ければ断る」という fail-closed なので、この集合は
- * **列挙漏れを起動時に落とすため**だけにある（`assertRouteClassified()`）。
- * 新しい経路を足した人は、どちらかに載せるまでサーバを起動できない。
+ * 判定そのものは「通す集合（`READ_ROUTES` と `NON_PERSISTING_CONTROL_ROUTES`）に無ければ
+ * 断る」という fail-closed なので、この集合は**列挙漏れを起動時に落とすため**だけにある
+ * （`assertRouteClassified()`）。新しい経路を足した人は、どれかに載せるまでサーバを起動できない。
  */
 export const MUTATING_ROUTES: ReadonlySet<string> = new Set([
   "POST /v1/user/spot/order",
@@ -49,14 +49,40 @@ export const MUTATING_ROUTES: ReadonlySet<string> = new Set([
   "POST /_control/orders/:order_id/fill",
 ]);
 
+/**
+ * **状態ファイルに書かない control の口。** 劣化中も通す。
+ *
+ * private stream の保留・再送（`src/stream/hub.ts` の `PrivateStreamHub`）の 3 つで、
+ * `PaperState` を読みも書きもせず、配信の層（hub のメモリ）だけを見る・変える。
+ * `READ_ROUTES` に入れないのは、hold / release が読み取りではないからである（載せると
+ * 「劣化中も通す読み取り経路」という名前と中身がずれる）。held だけは読み取りだが、
+ * 同じ hub のメモリを見る兄弟の口なのでここにまとめる。
+ *
+ * 劣化中に通すのは、**劣化の前に溜めたものを release で取り出せるようにするため**である
+ * （劣化の引き金になった `70001` の要求のイベントも含む）。溜めたものはメモリにしか無く、
+ * 復帰の手順（ディスクを直す → 読み出す → 再起動）で消えるので、断るとその回の stream の
+ * 実験を回収できない。劣化中は状態が動かないので、新しく溜まるものは無い。
+ *
+ * 載せてよいのは `/_control/` の経路だけ（`tests/server/degraded.test.ts` が見る）。
+ */
+export const NON_PERSISTING_CONTROL_ROUTES: ReadonlySet<string> = new Set([
+  "POST /_control/stream/hold",
+  "GET /_control/stream/held",
+  "POST /_control/stream/release",
+]);
+
 /** 判定に使う鍵。`HEAD` は `GET` に寄せる（Fastify が GET から自動登録するため）。 */
 export function routeKey(method: string, url: string): string {
   return `${method === "HEAD" ? "GET" : method} ${url}`;
 }
 
-/** 劣化中も通す経路か。**分類に無い経路は通さない**（fail-closed）。 */
-export function isReadRoute(method: string, url: string): boolean {
-  return READ_ROUTES.has(routeKey(method, url));
+/**
+ * 劣化中も通す経路か（読み取りと、状態ファイルに書かない control の口）。
+ * **分類に無い経路は通さない**（fail-closed）。
+ */
+export function passesWhileDegraded(method: string, url: string): boolean {
+  const key = routeKey(method, url);
+  return READ_ROUTES.has(key) || NON_PERSISTING_CONTROL_ROUTES.has(key);
 }
 
 /**
@@ -68,9 +94,12 @@ export function isReadRoute(method: string, url: string): boolean {
  */
 export function assertRouteClassified(method: string, url: string): void {
   const key = routeKey(method, url);
-  if (READ_ROUTES.has(key) || MUTATING_ROUTES.has(key)) return;
+  if (READ_ROUTES.has(key) || MUTATING_ROUTES.has(key) || NON_PERSISTING_CONTROL_ROUTES.has(key)) {
+    return;
+  }
   throw new Error(
-    `unclassified route ${key}: add it to READ_ROUTES or MUTATING_ROUTES in src/server/degraded.ts ` +
+    `unclassified route ${key}: add it to READ_ROUTES, MUTATING_ROUTES or ` +
+      "NON_PERSISTING_CONTROL_ROUTES in src/server/degraded.ts " +
       "(persist が失敗した後に断るかどうかを決める分類です)",
   );
 }

@@ -2,6 +2,8 @@ import type { FastifyInstance } from "fastify";
 import { describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { PRIVATE_STREAM_PATH } from "../../src/routes/private-stream.ts";
+import type { PrivateStreamMessage } from "../../src/stream/events.ts";
+import type { HeldMessage } from "../../src/stream/hub.ts";
 import { RESET_CLOSE_CODE, RESET_CLOSE_REASON } from "../../src/stream/hub.ts";
 import { buildState } from "../engine/helpers.ts";
 import { connectStream, setupBuildTestServer, streamRecorder } from "./helpers.ts";
@@ -125,6 +127,166 @@ describe("GET /_stream/private", () => {
     await fastify.inject({ method: "POST", url: "/v1/user/spot/order", payload: LIMIT_BUY });
     await rec.flush();
     expect(rec.methods()).toEqual(["spot_order_new", "asset_update"]);
+    ws.terminate();
+  });
+});
+
+/**
+ * 保留・再送（`/_control/stream/*`）で、公式が保証しない届き方を WebSocket 越しに再現する。
+ * 利用側の「単調性」「終端の優先」「fail-closed」を踏むための 3 つの形と、利用側が止まって
+ * いる間の変化を繋ぎ直した後に届ける形を見る（`docs/fidelity.md` の「private stream の保留・再送」節）。
+ */
+describe("GET /_stream/private と保留・再送", () => {
+  const build = setupBuildTestServer();
+
+  /** 注文の `status` と `executed_amount`。どのスナップショットが届いたかを読むのに使う。 */
+  const snapshot = (m: PrivateStreamMessage | undefined) => {
+    const p = m?.message.params[0] as { status: string; executed_amount: string };
+    return { method: m?.message.method, status: p.status, executed_amount: p.executed_amount };
+  };
+
+  /**
+   * 指値 0.002 を置いて接続し、保留してから半分ずつ 2 回約定させる。溜まるのは
+   * 部分約定（`spot_order` PARTIALLY_FILLED → `spot_trade` → `asset_update` × 2）と
+   * 全量約定（`spot_order` FULLY_FILLED → `spot_trade` → `asset_update` × 2）の 8 通。
+   */
+  async function heldPartialThenFull() {
+    const { fastify } = await build(buildState(), {}, { fillMode: "manual", controlEnabled: true });
+    const { ws, ...rec } = await connectStream(fastify);
+    await fastify.inject({
+      method: "POST",
+      url: "/v1/user/spot/order",
+      payload: { ...LIMIT_BUY, amount: 0.002 },
+    });
+    await rec.flush();
+    rec.take();
+
+    await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+    await fastify.inject({
+      method: "POST",
+      url: "/_control/orders/1/fill",
+      payload: { amount: 0.001 },
+    });
+    await fastify.inject({ method: "POST", url: "/_control/orders/1/fill" });
+    await rec.flush();
+    expect(rec.messages).toEqual([]);
+
+    const held = (await fastify.inject({ method: "GET", url: "/_control/stream/held" })).json()
+      .messages as HeldMessage[];
+    expect(held.map((m) => m.frame.message.method)).toEqual([
+      "spot_order",
+      "spot_trade",
+      "asset_update",
+      "asset_update",
+      "spot_order",
+      "spot_trade",
+      "asset_update",
+      "asset_update",
+    ]);
+    const seqOf = (method: string, status?: string) => {
+      const found = held.find(
+        (m) =>
+          m.frame.message.method === method &&
+          (status === undefined ||
+            (m.frame.message.params[0] as { status: string }).status === status),
+      );
+      if (!found) throw new Error(`${method} ${status ?? ""} が溜まっていない`);
+      return found.seq;
+    };
+    const release = (order?: number[]) =>
+      fastify.inject({
+        method: "POST",
+        url: "/_control/stream/release",
+        payload: order === undefined ? {} : { order },
+      });
+    return { fastify, ws, rec, held, seqOf, release };
+  }
+
+  it("FULLY_FILLED の spot_order の後に、それより前の PARTIALLY_FILLED の spot_order が届く", async () => {
+    const { ws, rec, seqOf, release } = await heldPartialThenFull();
+    const partial = seqOf("spot_order", "PARTIALLY_FILLED");
+    const full = seqOf("spot_order", "FULLY_FILLED");
+
+    const res = await release([full, partial]);
+    expect(res.statusCode).toBe(200);
+    await rec.flush();
+    expect(rec.messages.map(snapshot)).toEqual([
+      { method: "spot_order", status: "FULLY_FILLED", executed_amount: "0.0020" },
+      { method: "spot_order", status: "PARTIALLY_FILLED", executed_amount: "0.0010" },
+    ]);
+    ws.terminate();
+  });
+
+  it("同じ spot_order が 2 通届く", async () => {
+    const { ws, rec, held, seqOf, release } = await heldPartialThenFull();
+    const full = seqOf("spot_order", "FULLY_FILLED");
+    const all = held.map((m) => m.seq);
+
+    // 溜めた順にすべて送り、FULLY_FILLED の spot_order だけもう 1 度送る。
+    const res = await release([...all, full]);
+    expect(res.json()).toEqual({ sent: all.length + 1, omitted: [], clients: 1 });
+    await rec.flush();
+    const orders = rec.messages.filter((m) => m.message.method === "spot_order");
+    expect(orders.map(snapshot)).toEqual([
+      { method: "spot_order", status: "PARTIALLY_FILLED", executed_amount: "0.0010" },
+      { method: "spot_order", status: "FULLY_FILLED", executed_amount: "0.0020" },
+      { method: "spot_order", status: "FULLY_FILLED", executed_amount: "0.0020" },
+    ]);
+    // 2 通は同じフレームそのもの（作り直していない）。
+    expect(orders[2]).toEqual(orders[1]);
+    ws.terminate();
+  });
+
+  it("spot_trade が欠ける", async () => {
+    const { ws, rec, held, seqOf, release } = await heldPartialThenFull();
+    const firstTrade = seqOf("spot_trade");
+    const order = held.map((m) => m.seq).filter((seq) => seq !== firstTrade);
+
+    const res = await release(order);
+    expect(res.json()).toEqual({ sent: held.length - 1, omitted: [firstTrade], clients: 1 });
+    await rec.flush();
+    // 届いた約定は 2 回目（全量約定）の 1 通だけ。注文と資産の通知は欠けずに届く。
+    const secondTrade = held.find(
+      (m) => m.frame.message.method === "spot_trade" && m.seq !== firstTrade,
+    );
+    const trades = rec.messages.filter((m) => m.message.method === "spot_trade");
+    expect(trades).toEqual([secondTrade?.frame]);
+    expect(rec.messages).toEqual(held.filter((m) => m.seq !== firstTrade).map((m) => m.frame));
+    ws.terminate();
+  });
+
+  it("release の後は通常の配信に戻る", async () => {
+    const { fastify, ws, rec, release } = await heldPartialThenFull();
+    await release();
+    await rec.flush();
+    rec.take();
+    await fastify.inject({ method: "POST", url: "/v1/user/spot/order", payload: LIMIT_BUY });
+    await rec.flush();
+    expect(rec.methods()).toEqual(["spot_order_new", "asset_update"]);
+    ws.terminate();
+  });
+
+  it("保留の後に繋いだ接続にも、繋ぐ前の変化が release で届く（利用側が止まっている間の変化）", async () => {
+    const { fastify } = await build(buildState(), {}, { fillMode: "manual", controlEnabled: true });
+    await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+    // 誰も繋いでいない間の発注。保留中なので溜まる。
+    const placed = await fastify.inject({
+      method: "POST",
+      url: "/v1/user/spot/order",
+      payload: LIMIT_BUY,
+    });
+
+    const { ws, ...rec } = await connectStream(fastify);
+    await rec.flush();
+    expect(rec.messages).toEqual([]);
+    const res = await fastify.inject({ method: "POST", url: "/_control/stream/release" });
+    expect(res.json()).toEqual({ sent: 2, omitted: [], clients: 1 });
+    await rec.flush();
+    expect(rec.methods()).toEqual(["spot_order_new", "asset_update"]);
+    expect(rec.messages[0]?.message.params[0]).toMatchObject({
+      order_id: placed.json().data.order_id,
+      status: "UNFILLED",
+    });
     ws.terminate();
   });
 });
