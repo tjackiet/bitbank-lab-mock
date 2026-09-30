@@ -190,7 +190,7 @@ bitbank API には存在しません。本番クライアントから叩かな�
 | `GET` | `/_control/state` | `PaperState` に、状態ファイルへの書き出しの状況（`persist`）と足の取得の状況（`candles`）を添えて返す |
 | `POST` | `/_control/stream/hold` | private stream の保留を始める。以後の変化のメッセージは送らずに溜める（接続が 0 本でも溜める） |
 | `GET` | `/_control/stream/held` | 保留の状況と、溜めたメッセージを溜めた順に番号（`seq`、1 から）付きで返す |
-| `POST` | `/_control/stream/release` | `{ order: [番号, ...] }` の順に、その時点で接続している全員へ送って保留を解く。`order` 省略は溜めた順にすべて |
+| `POST` | `/_control/stream/release` | `{ order: [番号, ...] }` の順に、その時点で接続している全員へ送って保留を解く。`order` 省略は溜めた順にすべて。送るものがあるのに接続が 0 本なら 409（溜めたものは残る） |
 
 **private stream の順序の入れ替わり・重複・欠落は、保留・再送で起こします。** hold してから変化を起こし、held で番号を確かめて、release の `order` に並べます。同じ番号を 2 度書けば重複、書かなかった番号は欠落です。たとえば指値を半分ずつ 2 回約定させる間を保留すれば、`FULLY_FILLED` の `spot_order` の後に `PARTIALLY_FILLED` の `spot_order` を届けられます。
 
@@ -201,6 +201,8 @@ curl -s localhost:14000/_control/stream/held          # messages[].seq と messa
 # 部分約定の spot_order が 1 番、全量約定の spot_order が 5 番だったなら、5 → 1 の順に送る（他は欠落）
 curl -s -X POST localhost:14000/_control/stream/release -H 'content-type: application/json' -d '{"order":[5,1]}'
 ```
+
+接続が 1 本も無いときの release は、溜めたものが誰にも届かずに消えないよう 409 `NO_STREAM_CLIENTS` で断ります（保留も溜めたものも残ります）。溜めたものを捨てたいときは `{"order":[]}` で release してください。
 
 溜めるのは 10,000 通までです。超えた後の変化は溜めずに `overflowed` と `dropped`（落とした通数）を残し、以後の release は 409 で断ります（発注などの状態を変える要求は断りません）。抜け出すのは `POST /_control/reset` です。溜めたものはメモリにだけあり、再起動で消えます。細則は [`docs/fidelity.md`](docs/fidelity.md) の「private stream の保留・再送」の節にあります。
 

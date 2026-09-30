@@ -980,6 +980,33 @@ describe("/_control/stream", () => {
     }
   });
 
+  it("送るものがあるのに接続が 0 本の release は 409 NO_STREAM_CLIENTS で断り、保留も溜めたものも残す", async () => {
+    // 購読者を足さない（setup() は 1 人足すので使わない）。
+    const r = await buildControl(buildState({ balances: { jpy: 10_000_000 } }));
+    cleanups.push(async () => {
+      await r.fastify.close();
+    });
+    await r.fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+    await r.fastify.inject({ method: "POST", url: "/v1/user/spot/order", payload: LIMIT_BUY });
+    const held = () => r.fastify.inject({ method: "GET", url: "/_control/stream/held" });
+    const before = (await held()).json();
+
+    const res = await r.fastify.inject({ method: "POST", url: "/_control/stream/release" });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ error: "NO_STREAM_CLIENTS", held: 2 });
+    expect((await held()).json()).toEqual(before);
+
+    // 捨てたいときは空の order。送るものが 0 通なので接続が無くても通る。
+    const discard = await r.fastify.inject({
+      method: "POST",
+      url: "/_control/stream/release",
+      payload: { order: [] },
+    });
+    expect(discard.statusCode).toBe(200);
+    expect(discard.json()).toEqual({ sent: 0, omitted: [1, 2], clients: 0 });
+    expect((await held()).json()).toMatchObject({ holding: false, held: 0 });
+  });
+
   it("保留していないときの release は 409 NOT_HOLDING", async () => {
     const { fastify } = await setup();
     const res = await fastify.inject({ method: "POST", url: "/_control/stream/release" });
