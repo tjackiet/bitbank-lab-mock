@@ -12,7 +12,7 @@ import {
 } from "../engine/state.ts";
 import type { FetchCandles, Logger, Result } from "../engine/types.ts";
 import { noopLogger } from "../engine/types.ts";
-import { type FillMode, fillMode, persistFailureMode } from "../server/config.ts";
+import { type ClockMode, type FillMode, fillMode, persistFailureMode } from "../server/config.ts";
 import type { PersistFailureMode } from "../server/degraded.ts";
 
 const LATEST_LOOKBACK_MS = 5 * 60_000;
@@ -137,10 +137,21 @@ export type SessionStoreOptions = {
   fillMode?: FillMode;
   persistFailureMode?: PersistFailureMode;
   /**
-   * 時計（エポックミリ秒を返す関数）。`SessionStore.now()` の中身になる。既定は実時刻
-   * （呼ぶたびに `Date.now()` を読む）。
+   * 実時刻の時計（エポックミリ秒を返す関数）。既定は呼ぶたびに `Date.now()` を読む。
+   * 実時刻モードでは `SessionStore.now()` の中身そのもので、仮想時計のモードでは成行の価格を
+   * 取りに行く窓の基準（`getLatestPrice()` の既定）にだけ使う。
    */
   now?: () => number;
+  /**
+   * 記録する時刻の出どころ。**既定は `real`**（`now` の時計）で、`virtual` のときは状態の
+   * `lastTickAt` を仮想時計として読む（`SessionStore.now()`）。
+   *
+   * **`fillMode` と違って環境変数からは読まない。** 仮想時計は「control 有効かつ manual」の
+   * ときだけ使える決まりで（`docs/plan-lab-mock.md` 17.2 の決定 24）、その組み合わせを見て
+   * 起動を断るのは `src/index.ts`（`virtualClockConflicts()`）である。store が env から勝手に
+   * 拾うと、検査を通っていない経路（テストや別の組み立て）で黙って有効になる。
+   */
+  clockMode?: ClockMode;
 };
 
 export class SessionStore {
@@ -150,8 +161,10 @@ export class SessionStore {
   readonly feeRate: number;
   readonly fillMode: FillMode;
   readonly persistFailureMode: PersistFailureMode;
+  /** 記録する時刻の出どころ（`SessionStoreOptions.clockMode`）。`/_control/` の時計の規則も変わる。 */
+  readonly clockMode: ClockMode;
   private readonly logger: Logger;
-  /** 時計。`now()` で読む。 */
+  /** 実時刻の時計。実時刻モードでは `now()` がこれを読む。 */
   private readonly clock: () => number;
   /** 直列化した書き込みの末尾。次の書き込みはこれが解決してから始める。 */
   private persistTail: Promise<void> = Promise.resolve();
@@ -175,6 +188,8 @@ export class SessionStore {
     // `Date.now` の参照をここで固定せず、呼ぶたびに読む。固定すると、store を作った後に
     // `vi.useFakeTimers()` で `Date` を差し替えたテストで、この時計だけが実時刻のまま残る。
     this.clock = opts.now ?? (() => Date.now());
+    this.clockMode = opts.clockMode ?? "real";
+    if (this.clockMode === "virtual") assertVirtualClockUsable(state, this.fillMode);
     this._candlesHealth = {
       lastError: null,
       consecutiveFailures: 0,
@@ -189,21 +204,28 @@ export class SessionStore {
 
   /**
    * いまの時刻（エポックミリ秒）。**状態に記録する時刻の出どころはここ 1 か所に寄せる**
-   * （`docs/plan-lab-mock.md` 17.3 の PR C1）。仮想時計（PR C2）はこの中身だけを差し替える。
+   * （`docs/plan-lab-mock.md` 17.3 の PR C1）。
+   *
+   * - 実時刻モード（既定）: 実時刻の時計（`SessionStoreOptions.now`）
+   * - 仮想時計（`clockMode: "virtual"`）: 状態の `lastTickAt`（17.2 の決定 25）。**自分では
+   *   進まない**——動くのは `POST /_control/clock` と `POST /_control/tick` だけで、
+   *   `POST /_control/reset` で実時刻に戻る（決定 26）。状態ファイルに残るので再起動しても続く
    *
    * ここから読むもの:
    *
    * - 互換ルートの発注・取消の時刻（`ordered_at` / `canceled_at`。`src/routes/create-order.ts`・
    *   `src/routes/cancel-order.ts`）
    * - `/_control/` の fill の約定時刻と reject の時刻（`src/routes/control.ts`）
-   * - `tick()` と `getLatestPrice()` の `nowMs` の既定値
+   * - 仮想時計の `POST /_control/tick` / `POST /_control/clock` の基準（上限・下限・足の既定の時刻）
+   * - `tick()` の `nowMs` の既定値
    *
    * **ここから読まないもの**（実時刻のまま）:
    *
-   * - `POST /_control/tick` と `POST /_control/clock` の `realNowMs`。「実時刻から 24 時間」という
-   *   上限の基準なので、時計そのものからは測らない。**この値は上限のほかに、tick の前進の下限
-   *   （`max(realNowMs, lastTickAt + 60 秒)`）と、clock の本文を省いたときの行き先・`updatedAt` にも
-   *   使っている。** 仮想時計でこれらをどう扱うかは PR C2 で決める（17.2 の決定 25〜27）
+   * - `POST /_control/tick` と `POST /_control/clock` の `realNowMs`。実時刻モードの上限
+   *   （実時刻 + 24 時間）・tick の前進の下限・clock の本文を省いたときの行き先と、両モードの
+   *   clock の `updatedAt` に使う（`src/routes/control.ts`）
+   * - `getLatestPrice()` の窓（成行の価格）。仮想時計を実時刻より先へ進めても足が取れるよう、
+   *   実時刻の窓で取る（`docs/fidelity.md` の「仮想時計」節）
    * - `freshState()` の時刻（状態ファイルが無いときと `POST /_control/reset`）。reset で時計は
    *   実時刻に戻る（`docs/plan-lab-mock.md` 17.2 の決定 25）
    * - 書き出し失敗の記録時刻（`persistHealth()` の `lastError.at`）。診断用なので実時刻が正しい
@@ -212,6 +234,7 @@ export class SessionStore {
    * `tests/routes/time-source.test.ts` が見る。
    */
   now(): number {
+    if (this.clockMode === "virtual") return Date.parse(this._state.lastTickAt);
     return this.clock();
   }
 
@@ -475,8 +498,13 @@ export class SessionStore {
    * `null` を返す経路は 2 つ（取得の失敗と、窓に足が 1 本も無いこと）あり、呼び出し側は
    * どちらも封筒の `70001` に潰す。**どちらだったかは `candlesHealth()` で見分ける**
    * （取得の失敗ならそこに記録が残る）。`fillMode` が `manual` でもここは取りに行く。
+   *
+   * **窓の既定は実時刻の時計**で、`now()` ではない。実時刻モードでは同じ値だが、仮想時計では
+   * `now()` を基準にすると、時計を実時刻より先へ進めた途端に窓の中の足が無くなり、成行が
+   * 常に `70001` で断られる。価格は実時刻の窓で取り、記録する時刻（`ordered_at` と約定時刻）
+   * だけを仮想にする（`docs/fidelity.md` の「仮想時計」節）。
    */
-  async getLatestPrice(pair: string, nowMs: number = this.now()): Promise<number | null> {
+  async getLatestPrice(pair: string, nowMs: number = this.clock()): Promise<number | null> {
     const r = await this.fetchCandlesTracked(pair, nowMs - LATEST_LOOKBACK_MS, nowMs);
     if (!r.success || r.data.length === 0) return null;
     return r.data.reduce((a, b) => (a.timestamp >= b.timestamp ? a : b)).close;
@@ -560,6 +588,29 @@ export class SessionStore {
     } catch {
       // 失敗は既に `_persistHealth` へ記録済みなので、ログに出せなくても見る手段は残る。
     }
+  }
+}
+
+/**
+ * 仮想時計を使える状態と設定か。使えなければ throw する（起動を止める）。
+ *
+ * - `fillMode` が `manual` でない: market モードの `tick()` は `now()` を足の取得範囲の終端に
+ *   使い、終わりに `lastTickAt` を `now()` で上書きする。仮想時計ではその `now()` が
+ *   `lastTickAt` そのものなので、時計が永久に止まる。env の組み合わせは `src/index.ts` が
+ *   先に断る（`virtualClockConflicts()`）ので、ここはそれを通らない組み立てへの歯止め
+ * - `lastTickAt` が日付として解釈できない（状態ファイル由来）: `now()` が `NaN` になり、
+ *   互換ルートが記録する時刻を作る `toISOString()` が `RangeError` で落ちる（封筒でない 500）。
+ *   実時刻モードでは `lastTickAt` を記録の時刻に使わないので、ここでだけ断る
+ */
+function assertVirtualClockUsable(state: PaperState, mode: FillMode): void {
+  if (mode !== "manual") {
+    throw new Error(`virtual clock requires fillMode "manual" (got ${JSON.stringify(mode)})`);
+  }
+  if (Number.isNaN(Date.parse(state.lastTickAt))) {
+    // 状態ファイル由来の文字列なので JSON で包む（改行でログ行を割らせない）。
+    throw new Error(
+      `virtual clock requires a parseable lastTickAt (got ${JSON.stringify(state.lastTickAt)})`,
+    );
   }
 }
 

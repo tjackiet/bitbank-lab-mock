@@ -262,3 +262,33 @@ export function availableOf(
   const locked = amountOf(computeLocked(state, feeRate), asset);
   return total - locked;
 }
+
+/**
+ * 状態が持つ「記録」の時刻の最大（エポックミリ秒）。記録が 1 つも無ければ `null`。
+ *
+ * **「記録」とみなすのは、注文の `orderedAt` / `canceledAt` と、約定（trade）の `executedAt`
+ * だけ**である（`docs/plan-lab-mock.md` 17.2 の決定 28）。`updatedAt` と `lastTickAt` は含めない。
+ * 注文の約定時刻（private stream の `executed_at`）は `OrderRecord` には無く trade から作るので、
+ * 約定の側で数える。
+ *
+ * 仮想時計（`BITBANK_MOCK_CLOCK=virtual`）の `POST /_control/clock` が、時計をこれより前へ
+ * 置くのを断るために使う（記録の時刻の順を崩さないため）。
+ *
+ * 日付として解釈できない文字列（状態ファイル由来）は比べようがないので数えない
+ * （`docs/fidelity.md` の「解釈できない時刻を持つ state」節）。
+ */
+export function latestRecordMs(state: PaperState): number | null {
+  let latest: number | null = null;
+  const consider = (at: string | null) => {
+    if (at === null) return;
+    const ms = Date.parse(at);
+    if (Number.isNaN(ms)) return;
+    if (latest === null || ms > latest) latest = ms;
+  };
+  for (const o of state.orders) {
+    consider(o.orderedAt);
+    consider(o.canceledAt);
+  }
+  for (const t of state.trades) consider(t.executedAt);
+  return latest;
+}

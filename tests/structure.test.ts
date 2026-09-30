@@ -73,6 +73,9 @@ const TEST_WITHOUT_SRC: Record<string, string> = {
   "scenarios/private-stream.test.ts":
     "結合シナリオ。互換ルートと `/_control/` の操作が private stream に何を流すかを、" +
     "状態の変化の経路（発注・約定・取消・market の tick・劣化）ごとに端から端まで通す",
+  "scenarios/virtual-clock.test.ts":
+    "結合シナリオ。仮想時計で、互換ルートと `/_control/` と private stream が記録する時刻を" +
+    "端から端まで通す",
   "scenarios/example-script.test.ts":
     "`examples/scenario-plan-a.sh` を実プロセスのサーバへ流す。見る対象が src ではなく" +
     "リポジトリに置いた例のスクリプトそのもの",

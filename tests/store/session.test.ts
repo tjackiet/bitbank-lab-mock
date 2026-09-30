@@ -293,6 +293,96 @@ describe("SessionStore.now", () => {
   });
 });
 
+/**
+ * 仮想時計（`clockMode: "virtual"`）。`now()` は状態の `lastTickAt` を読み、自分では進まない
+ * （`docs/plan-lab-mock.md` 17.2 の決定 25・26）。
+ */
+describe("SessionStore の仮想時計", () => {
+  it("既定は実時刻（env からは読まない）", () => {
+    const store = new SessionStore(buildState(), { path: null, fillMode: "manual" });
+    expect(store.clockMode).toBe("real");
+  });
+
+  it("now() は lastTickAt を読み、実時刻の時計は読まない", async () => {
+    let realReads = 0;
+    const store = new SessionStore(buildState({ lastTickAt: new Date(T0).toISOString() }), {
+      path: null,
+      fillMode: "manual",
+      clockMode: "virtual",
+      now: () => {
+        realReads += 1;
+        return T0 + 99 * MIN;
+      },
+    });
+    expect(store.now()).toBe(T0);
+    expect(store.now()).toBe(T0);
+    // 状態の lastTickAt を差し替えた分だけ動く（`/_control/clock` と `/_control/tick` の経路）。
+    await store.commit({ ...store.state(), lastTickAt: new Date(T0 + 1).toISOString() });
+    expect(store.now()).toBe(T0 + 1);
+    expect(realReads).toBe(0);
+  });
+
+  // 成行の価格は実時刻の窓で取る。仮想時刻を基準にすると、時計を実時刻より先へ進めた途端に
+  // 窓の中の足が無くなり、成行が常に 70001 で断られる（`docs/fidelity.md` の「仮想時計」節）。
+  it("getLatestPrice() の既定の窓は実時刻の時計", async () => {
+    const calls: Array<[number, number]> = [];
+    const fetchCandles: FetchCandles = async (_pair, fromMs, toMs) => {
+      calls.push([fromMs, toMs]);
+      return { success: true, data: [candle(T0, 110, 110, 90, 105)] };
+    };
+    const store = new SessionStore(
+      buildState({ lastTickAt: new Date(T0 + 30 * 24 * 60 * MIN).toISOString() }),
+      { path: null, fillMode: "manual", clockMode: "virtual", fetchCandles, now: () => T0 + MIN },
+    );
+    expect(await store.getLatestPrice("btc_jpy")).toBe(105);
+    expect(calls).toEqual([[T0 + MIN - 5 * MIN, T0 + MIN]]);
+  });
+
+  // market の tick() は `now()` を足の取得範囲の終端に使い、終わりに lastTickAt を `now()` で
+  // 上書きする。仮想時計ではその `now()` が lastTickAt そのものなので、時計が止まる。
+  it("fillMode が manual でなければ作れない", () => {
+    expect(
+      () =>
+        new SessionStore(buildState(), {
+          path: null,
+          fillMode: "market",
+          clockMode: "virtual",
+          fetchCandles: stubFetchCandles({}),
+        }),
+    ).toThrow('virtual clock requires fillMode "manual"');
+  });
+
+  // 解釈できない lastTickAt（状態ファイル由来）のまま始めると、互換ルートが記録する時刻を作る
+  // `toISOString()` が RangeError で落ち、封筒でない 500 になる。起動の時点で断る。
+  it("lastTickAt が解釈できなければ作れない", () => {
+    expect(
+      () =>
+        new SessionStore(buildState({ lastTickAt: "not-a-date\nINFO injected" }), {
+          path: null,
+          fillMode: "manual",
+          clockMode: "virtual",
+        }),
+    ).toThrow('virtual clock requires a parseable lastTickAt (got "not-a-date\\nINFO injected")');
+    // 実時刻モードは lastTickAt を記録の時刻に使わないので、今までどおり作れる。
+    expect(
+      () => new SessionStore(buildState({ lastTickAt: "not-a-date" }), { path: null }),
+    ).not.toThrow();
+  });
+
+  it("loadOrInitDefault() に渡すと、状態ファイルの lastTickAt から続く", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "bitbank-mock-virtual-"));
+    try {
+      const path = join(dir, "state.json");
+      const first = new SessionStore(buildState(), { path, fillMode: "manual" });
+      await first.commit({ ...first.state(), lastTickAt: new Date(T0 + 7).toISOString() });
+      const second = await loadOrInitDefault(0, { path, fillMode: "manual", clockMode: "virtual" });
+      expect(second.now()).toBe(T0 + 7);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("SessionStore.persist", () => {
   let dir: string;
 

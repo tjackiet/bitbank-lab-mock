@@ -149,6 +149,7 @@ BITBANK_MOCK_CONTROL=1 npm run dev
 | --- | --- | --- |
 | `BITBANK_MOCK_CONTROL` | 未設定（control 無効） | `1` のとき `/_control/` を登録する |
 | `BITBANK_MOCK_FILL_MODE` | control 有効時 `manual`、無効時 `market` | `manual` では REST の `tick()` が市場足を取りに行かない |
+| `BITBANK_MOCK_CLOCK` | `real`（実時刻） | `virtual` のとき、記録する時刻（`ordered_at` / `canceled_at` / 約定時刻）を `/_control/clock` と `/_control/tick` でだけ動く仮想時計で打つ。**`BITBANK_MOCK_CONTROL=1` かつ manual モードのときだけ使え、それ以外と同時に指定すると起動しない**。空文字と未知の値は `real` |
 | `BITBANK_MOCK_HOST` | control 有効時 `127.0.0.1`、無効時 `0.0.0.0` | listen アドレス |
 | `BITBANK_MOCK_PORT` | `14000` | listen ポート |
 | `BITBANK_MOCK_CONTROL_TOKEN` | 未設定 | 非ループバックからの `/_control/` に必要な `X-Control-Token` |
@@ -186,9 +187,9 @@ bitbank API には存在しません。本番クライアントから叩かな�
 | `POST` | `/_control/orders/:order_id/fill` | 指定注文を約定。`amount` 省略は残量全部、`price` 省略は指値 |
 | `POST` | `/_control/orders/:order_id/reject` | 指定注文を `REJECTED` にする（`UNFILLED` / `INACTIVE` のときだけ。部分約定済みは 409）。拘束が外れ、private stream には `REJECTED` の `spot_order` が流れる |
 | `POST` | `/_control/tick` | `{ pair, price }` または `{ pair, candle }` で人工の足を 1 本適用 |
-| `POST` | `/_control/clock` | 時計（`lastTickAt`）を動かす。本文省略で現在時刻、`{ lastTickAt }` に ISO 文字列かエポックミリ秒。注文・約定・残高は残る（`updatedAt` は書き込み時刻として動きます） |
+| `POST` | `/_control/clock` | 時計（`lastTickAt`）を動かす。本文省略で現在時刻（仮想時計では 400）、`{ lastTickAt }` に ISO 文字列かエポックミリ秒、`{ advanceMs }` にいまの時計から進めるミリ秒（1 回で 24 時間まで）。注文・約定・残高は残る（`updatedAt` は書き込み時刻として動きます） |
 | `POST` | `/_control/reset` | 状態を初期化（private stream の接続は close code `1012` で閉じ、保留中なら溜めたものを捨てて保留を解く） |
-| `GET` | `/_control/state` | `PaperState` に、状態ファイルへの書き出しの状況（`persist`）と足の取得の状況（`candles`）を添えて返す |
+| `GET` | `/_control/state` | `PaperState` に、状態ファイルへの書き出しの状況（`persist`）と足の取得の状況（`candles`）を添えて返す（仮想時計のときは `clock: { mode: "virtual" }` も） |
 | `POST` | `/_control/stream/hold` | private stream の保留を始める。以後の変化のメッセージは送らずに溜める（接続が 0 本でも溜める） |
 | `GET` | `/_control/stream/held` | 保留の状況と、溜めたメッセージを溜めた順に番号（`seq`、1 から）付きで返す |
 | `POST` | `/_control/stream/release` | `{ order: [番号, ...] }` の順に、その時点で接続している全員へ送って保留を解く。`order` 省略は溜めた順にすべて。送るものがあるのに接続が 0 本なら 409（溜めたものは残る） |
@@ -209,7 +210,19 @@ curl -s -X POST localhost:14000/_control/stream/release -H 'content-type: applic
 
 **市場モード（`BITBANK_MOCK_FILL_MODE=market`）で足が取れているかは `GET /_control/state` の `candles` で確かめます。** 取得に失敗しても互換ルートは成功応答を返し続け、失敗した窓は取り直さないので、**約定が無いことだけからは「価格が注文に届いていない」と「足の取得に失敗している」を区別できません**。`lastError`（直近の失敗。成功しても消えません）、`consecutiveFailures`（連続失敗数。今まさに失敗し続けているか）、`lastSuccessAt`（いつまで足が取れていたか。`lastTickAt` と並べて読みます）、`fillMode`（`manual` なら `tick()` はそもそも取りに行きません）を見てください。詳細は [`docs/fidelity.md`](docs/fidelity.md) の「足の取得の健全性」の節にあります。
 
-`POST /_control/tick` が進める `lastTickAt`（control の時計）は、足の `timestamp` でも tick ごとの 60 秒の前進でも、実時刻より先へは 24 時間までしか動きません。超える要求は 400（`CANDLE_TOO_FAR_AHEAD` / `CLOCK_TOO_FAR_AHEAD`）で断り、状態は変えません。戻すのは `POST /_control/clock` です（`reset` と違って注文・約定・残高は残ります）。詳細は [`docs/fidelity.md`](docs/fidelity.md) の「control の時計」の節にあります。
+`POST /_control/tick` が進める `lastTickAt`（control の時計）は、既定の実時刻モードでは、足の `timestamp` でも tick ごとの 60 秒の前進でも、実時刻より先へは 24 時間までしか動きません。超える要求は 400（`CANDLE_TOO_FAR_AHEAD` / `CLOCK_TOO_FAR_AHEAD`）で断り、状態は変えません。戻すのは `POST /_control/clock` です（`reset` と違って注文・約定・残高は残ります）。詳細は [`docs/fidelity.md`](docs/fidelity.md) の「control の時計」の節にあります。
+
+**注文・約定・取消の時刻そのものを動かしたいときは仮想時計を使います**（`BITBANK_MOCK_CLOCK=virtual`。`BITBANK_MOCK_CONTROL=1` かつ manual モードのときだけ）。既定の実時刻モードでは、互換ルートが記録する `ordered_at` / `canceled_at` と `/_control/` の fill の約定時刻は実時刻のままです。仮想時計では `lastTickAt` がそのまま「いまの時刻」になり、**自分では進みません**——`POST /_control/clock` の `{ advanceMs }`（ミリ秒単位）か `{ lastTickAt }`、`POST /_control/tick`（1 分足が閉じた時刻へ進む）でだけ動きます。1 回で進めるのは 24 時間までで、繰り返せば何日でも先へ行けます。既存の注文・約定・取消の時刻より前へは戻せません（戻したいときは `reset`。reset で時計は実時刻に戻ります）。時計は状態ファイルに残るので、再起動しても続きます。
+
+```bash
+BITBANK_MOCK_CONTROL=1 BITBANK_MOCK_CLOCK=virtual npm run dev
+curl -s -X POST localhost:14000/_control/clock -H 'content-type: application/json' -d '{"lastTickAt":"2026-01-01T00:00:00.000Z"}'
+# ……発注（ordered_at はちょうど 2026-01-01T00:00:00.000Z）……
+curl -s -X POST localhost:14000/_control/clock -H 'content-type: application/json' -d '{"advanceMs":600000}'
+# ……取消（canceled_at はちょうど 10 分後）……
+```
+
+成行だけは価格を実時刻の窓で取り、記録する時刻だけを仮想にします（約定価格はその仮想時刻の市場価格ではありません）。細則は [`docs/fidelity.md`](docs/fidelity.md) の「仮想時計」の節にあります。
 
 無効時は 404。非ループバックはトークンが一致しない限り 403 です。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が 503 `PERSIST_DEGRADED` になります（`GET /_control/state` と、状態ファイルに書かない `stream/hold` / `stream/held` / `stream/release` は通ります）。**ループバックからはトークン無しで通る**ので、同一ホスト上の他プロセスからの誤操作は防げません。接続元の判定には TCP の対向アドレスだけを使い、`X-Forwarded-For` は見ません（Fastify の `trustProxy` の設定に境界は左右されません。ただし判定を `request.ip` に変えると、`trustProxy` を有効にした瞬間にヘッダの詐称で迂回できるようになります）。`X-Control-Token` はヘッダ行がちょうど 1 本のときだけ受け付けます。
 

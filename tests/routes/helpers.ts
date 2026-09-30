@@ -6,7 +6,7 @@ import type { PaperState } from "../../src/engine/state.ts";
 import type { FetchCandles, Logger } from "../../src/engine/types.ts";
 import type { AssetKeyStyle } from "../../src/routes/format.ts";
 import { PRIVATE_STREAM_PATH } from "../../src/routes/private-stream.ts";
-import type { FillMode } from "../../src/server/config.ts";
+import type { ClockMode, FillMode } from "../../src/server/config.ts";
 import { buildServer } from "../../src/server/http.ts";
 import { SessionStore } from "../../src/store/session.ts";
 import type { PrivateStreamMessage } from "../../src/stream/events.ts";
@@ -47,6 +47,11 @@ export type TestServerOptions = {
    * いるかを見るテストだけが渡す**（`tests/routes/time-source.test.ts`）。
    */
   now?: () => number;
+  /**
+   * 既定は `real`。**仮想時計（`virtual`）を見るテストだけが渡す**（`fillMode: "manual"` も要る。
+   * `SessionStore` が他の組み合わせを断る）。
+   */
+  clockMode?: ClockMode;
 };
 
 export async function buildTestServer(
@@ -61,6 +66,7 @@ export async function buildTestServer(
     logger: opts.logger,
     feeRate: opts.feeRate,
     now: opts.now,
+    clockMode: opts.clockMode,
   });
   const fastify = await buildServer({
     store,

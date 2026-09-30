@@ -1,6 +1,13 @@
 import { defaultStatePath, sweepOrphanTempFiles } from "./engine/persist.ts";
 import { PRIVATE_STREAM_PATH } from "./routes/private-stream.ts";
-import { fillMode, isControlEnabled, listenHost, persistFailureMode } from "./server/config.ts";
+import {
+  clockMode,
+  fillMode,
+  isControlEnabled,
+  listenHost,
+  persistFailureMode,
+  virtualClockConflicts,
+} from "./server/config.ts";
 import { buildServer } from "./server/http.ts";
 import { acquireStateLock, StateLockedError } from "./store/lock.ts";
 import { loadOrInitDefault } from "./store/session.ts";
@@ -32,8 +39,20 @@ async function main() {
   const port = parsePort(argv);
   const control = isControlEnabled();
   const mode = fillMode();
+  const clock = clockMode();
   const persistMode = persistFailureMode();
   const host = listenHost();
+
+  // 仮想時計と矛盾する設定なら、状態ファイルに触れる前に断る（`docs/plan-lab-mock.md` 17.2 の
+  // 決定 24）。warn で済ませて実時刻へ落とすと、時計を進めたつもりの実験が黙って実時刻で走る。
+  const conflicts = virtualClockConflicts();
+  if (conflicts.length > 0) {
+    console.error(
+      "BITBANK_MOCK_CLOCK=virtual は BITBANK_MOCK_CONTROL=1 かつ manual モードのときだけ使えます: " +
+        conflicts.join(" / "),
+    );
+    process.exit(1);
+  }
 
   // 状態ファイルを読む前に排他を取る。取れなければ起動しない。
   // 2 プロセスが同じ状態ファイルを使うと、両方が成功を返しながら片方の注文が丸ごと消える。
@@ -53,6 +72,7 @@ async function main() {
     path: statePath,
     logger: { warn: (m) => console.warn(m), info: (m) => console.log(m) },
     fillMode: mode,
+    clockMode: clock,
   });
   const fastify = await buildServer({
     store,
@@ -102,7 +122,8 @@ async function main() {
   // persistFailure は既定が degrade（v0.1.0 からの変更）なので、起動時に見えるようにしておく。
   console.log(
     `bitbank-lab-mock listening on http://${host}:${port} fillMode=${mode} ` +
-      `persistFailure=${persistMode}${control ? " control=on" : ""}`,
+      `persistFailure=${persistMode}${control ? " control=on" : ""}` +
+      `${clock === "virtual" ? " clock=virtual" : ""}`,
   );
   // private stream は PubNub ではなく素の WebSocket なので、接続先を起動時に見せておく。
   console.log(`private stream: ws://${host}:${port}${PRIVATE_STREAM_PATH}`);
