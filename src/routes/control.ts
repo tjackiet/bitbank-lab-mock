@@ -388,6 +388,8 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
    * - 上限に達して落とした変化がある: 409 `STREAM_HOLD_OVERFLOWED`（保留は解かない。抜け出すのは
    *   `POST /_control/reset`）
    * - `order` の形・範囲・長さが違う: 400 `INVALID_RELEASE_ORDER`
+   * - 送るものが 1 通以上あるのに接続が 0 本: 409 `NO_STREAM_CLIENTS`（繋いでから送り直すか、
+   *   捨てたいなら `order: []`）
    *
    * 断ったときは保留も溜めたものもそのまま残す。
    */
@@ -405,6 +407,9 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
     if (r.error === "OVERFLOWED") {
       const { limit, dropped } = hub.holdStatus();
       return reply.code(409).send({ error: "STREAM_HOLD_OVERFLOWED", limit, dropped });
+    }
+    if (r.error === "NO_CLIENTS") {
+      return reply.code(409).send({ error: "NO_STREAM_CLIENTS", held: hub.holdStatus().held });
     }
     return invalid();
   });

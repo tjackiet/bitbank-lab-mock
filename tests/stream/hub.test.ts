@@ -341,15 +341,47 @@ describe("PrivateStreamHub の保留・再送", () => {
     expect(hub.holdStatus().holding).toBe(false);
   });
 
-  it("購読者が 0 人でも release は断らず、clients: 0 を返す", () => {
+  it("送るものがあるのに購読者が 0 人なら NO_CLIENTS で断り、保留も溜めたものも残す", () => {
+    const { hub, place } = held();
+    hub.hold();
+    const frames = place();
+    const before = hub.heldMessages();
+
+    expect(hub.release()).toEqual({ success: false, error: "NO_CLIENTS" });
+    expect(hub.release([2, 2])).toEqual({ success: false, error: "NO_CLIENTS" });
+    expect(hub.heldMessages()).toEqual(before);
+    expect(hub.holdStatus().holding).toBe(true);
+
+    // 繋いでから送り直せば届く（利用側が止まっている間の変化を、繋ぎ直した後に届ける形）。
+    const r = recorder();
+    hub.addClient(r.client);
+    expect(hub.release()).toEqual({
+      success: true,
+      data: { sent: 2, omitted: [], clients: 1 },
+    });
+    expect(r.sent).toEqual(frames);
+  });
+
+  it("送るものが 0 通なら購読者が 0 人でも断らない（空の order で溜めたものを捨てられる）", () => {
     const { hub, place } = held();
     hub.hold();
     place();
-    expect(hub.release()).toEqual({
+    expect(hub.release([])).toEqual({
       success: true,
-      data: { sent: 2, omitted: [], clients: 0 },
+      data: { sent: 0, omitted: [1, 2], clients: 0 },
     });
-    expect(hub.holdStatus().holding).toBe(false);
+    expect(hub.holdStatus()).toMatchObject({ holding: false, held: 0 });
+
+    // 何も溜まっていない保留を order の省略で解くのも、送るものが 0 通なので通る。
+    hub.hold();
+    expect(hub.release()).toEqual({ success: true, data: { sent: 0, omitted: [], clients: 0 } });
+  });
+
+  it("order の検査は購読者の有無より先に行う", () => {
+    const { hub, place } = held();
+    hub.hold();
+    place();
+    expect(hub.release([3])).toEqual({ success: false, error: "INVALID_ORDER" });
   });
 
   it("保留していなければ release は NOT_HOLDING で断る", () => {

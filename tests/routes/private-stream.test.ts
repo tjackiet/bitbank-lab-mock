@@ -276,6 +276,11 @@ describe("GET /_stream/private と保留・再送", () => {
       payload: LIMIT_BUY,
     });
 
+    // 繋ぐ前の release は断られ、溜めたものは残る（誰にも届かずに消えない）。
+    const early = await fastify.inject({ method: "POST", url: "/_control/stream/release" });
+    expect(early.statusCode).toBe(409);
+    expect(early.json()).toEqual({ error: "NO_STREAM_CLIENTS", held: 2 });
+
     const { ws, ...rec } = await connectStream(fastify);
     await rec.flush();
     expect(rec.messages).toEqual([]);

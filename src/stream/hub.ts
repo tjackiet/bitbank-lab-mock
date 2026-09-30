@@ -91,7 +91,7 @@ export type ReleaseSummary = {
   sent: number;
   /** 指定しなかった（＝欠落させた）番号。溜めた順。 */
   omitted: number[];
-  /** 送った時点で接続していた購読者の数。0 なら誰にも届いていない。 */
+  /** 送った時点で接続していた購読者の数。0 になるのは送った通数も 0 のときだけ。 */
   clients: number;
 };
 
@@ -102,8 +102,10 @@ export type ReleaseSummary = {
  * - `OVERFLOWED`: 上限に達して落とした変化がある。送ると欠落が利用者の指定ではなく
  *   モックの都合で起きるので、送らない。抜け出すのは reset
  * - `INVALID_ORDER`: `order` が溜めた番号の範囲外・整数でない・上限より長い
+ * - `NO_CLIENTS`: 送るものが 1 通以上あるのに購読者が 0 人。送っても誰にも届かずに消えるので、
+ *   送らない（溢れと同じく、溜めたものを黙って消さない）。捨てたいときは空の `order` で release する
  */
-export type ReleaseError = "NOT_HOLDING" | "OVERFLOWED" | "INVALID_ORDER";
+export type ReleaseError = "NOT_HOLDING" | "OVERFLOWED" | "INVALID_ORDER" | "NO_CLIENTS";
 
 export type ReleaseResult =
   | { success: true; data: ReleaseSummary }
@@ -218,7 +220,9 @@ export class PrivateStreamHub {
    *
    * 送る相手は release の時点の購読者で、**保留の後に繋いだ接続にも、繋ぐ前の変化が届く**
    * （「接続した後の変化だけが届く」の例外。`docs/fidelity.md` の「private stream の保留・再送」）。
-   * 購読者が 0 人でも断らない（溜めたものは誰にも届かずに消え、`clients: 0` が返る）。
+   * **送るものが 1 通以上あるのに購読者が 0 人なら断る**——利用側が繋ぎ直す前に release すると、
+   * 溜めたものが誰にも届かずに消えるため。空の `order`（送るものが 0 通）は購読者がいなくても通るので、
+   * 溜めたものを捨てたいときはそれで保留を解く。
    *
    * 断ったとき（`success: false`）は保留も溜めたものもそのまま残す。
    */
@@ -235,6 +239,9 @@ export class PrivateStreamHub {
       const frame = Number.isInteger(seq) ? buffer.frames[seq - 1] : undefined;
       if (frame === undefined) return { success: false, error: "INVALID_ORDER" };
       frames.push(frame);
+    }
+    if (frames.length > 0 && this.clients.size === 0) {
+      return { success: false, error: "NO_CLIENTS" };
     }
     // 送る前に保留を解く。送信は同期で store に触れないので、送っている途中に溜まるものは無い。
     this.buffer = null;
