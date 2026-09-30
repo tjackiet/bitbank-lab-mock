@@ -30,7 +30,7 @@ bitbank Private REST API と同じパスで、**発注・約定・取消・注�
 ### 無いもの
 
 - **PubNub**: private stream は PubNub ではなく素の WebSocket で配信します。PubNub SDK のままでは繋がりません（下の「[private stream](#private-stream)」節）
-- **private stream の障害注入**: 順序の入れ替わり・重複・欠落は起こせません。モックは常に発生順に 1 回ずつ届けます（公式は順序を保証しません）
+- **private stream の自然な入れ替わり**: モックは自分からは順序を入れ替えず、重複も欠落も起こしません（公式は順序を保証しません）。耐性を試すときは `/_control/stream/*` の保留・再送で、入れ替わり・重複・欠落を狙って起こします（下の「[`/_control/`](#_control)」節）
 - **認証ヘッダの検証**: どんなヘッダでも、無くても通ります。private stream の接続も同じです。本物の API キーを向けないでください
 - **レート制限**: どれだけ叩いても 429（`10009`）は返りません
 - **注文訂正**: 発注後に価格や数量を変える口はありません
@@ -106,7 +106,8 @@ node -e 'const ws = new WebSocket("ws://127.0.0.1:14000/_stream/private"); ws.on
 - **`GET /v1/user/subscribe` の `pubnub_channel` / `pubnub_token` はダミーです。** 接続では見ません。期限切れも起きません
 - **いつ届くかはモック固有です。** `manual` モードでは互換ルートの発注・取消と `/_control/` の操作でだけ届きます。`market` モードでは誰かが互換ルートを叩いたとき（読み取りでも）に約定とイベントが起きます（control を有効にしていれば `/_control/` の fill / tick でも起きます）。**ただし `GET /v1/user/subscribe` だけは状態を読まないので、叩いても約定は進みません**。裏で市場を見張ってはいないので、**何も叩かなければ何も届きません**
 - **HTTP の応答より先に届くことがあります。** 状態がメモリに反映された直後に送るためで、書き出しに失敗して `70001` を返した発注のイベントも流れます
-- **`POST /_control/reset` は接続を close code `1012` で閉じます。** reset で注文 id が 1 から配り直されるためです。繋ぎ直して、手元の注文の対応表を REST で取り直してください
+- **`POST /_control/reset` は接続を close code `1012` で閉じます。** reset で注文 id が 1 から配り直されるためです。繋ぎ直して、手元の注文の対応表を REST で取り直してください。保留中なら溜めたものも捨て、保留を解きます
+- **モックは順序を入れ替えません。** 入れ替わり・重複・欠落は `/_control/stream/*` の保留・再送で起こします（下の「[`/_control/`](#_control)」節）。**保留の後に繋いだ接続にも、release で繋ぐ前の変化が届きます**（「接続した後の変化だけが届く」の例外）
 - クライアントから送ったものは読みません（1024 バイトを超えるフレームは close code `1009` で閉じます）。upgrade でない `GET /_stream/private` には `426` を返します
 
 どこまで本物と同じか・どこを推測で決めたかは [`docs/fidelity.md`](docs/fidelity.md) の「[private stream](docs/fidelity.md#private-stream)」節から始まる一連の節にあります。
@@ -166,7 +167,7 @@ Error: paper state violates invariants: 6 violation(s): 1: order 1 executedAmoun
 
 v1 / v2 の状態ファイルを v3 へ移行した結果が不変量を破っている場合だけは、起動を止めずに warn を出します（`migrated paper state violates invariants: ...`）。
 
-**書き出しに一度でも失敗すると、以後は状態を変える要求を断ります**（v0.1.0 からの変更）。発注・取消・`/_control/` の fill / tick / clock / reset は断り、照会（`GET order` / `orders_info` / `active_orders` / `trade_history` / `assets` / `GET /_control/state`）は今までどおり通します。失敗したシナリオを読み出せるようにするためです。断り方は互換ルートが封筒の `70001`、`/_control/` が 503 `PERSIST_DEGRADED` です。
+**書き出しに一度でも失敗すると、以後は状態を変える要求を断ります**（v0.1.0 からの変更）。発注・取消・`/_control/` の fill / tick / clock / reset は断り、照会（`GET order` / `orders_info` / `active_orders` / `trade_history` / `assets` / `GET /_control/state`）は今までどおり通します。状態ファイルに書かない `/_control/stream/*`（private stream の保留・再送）も通します。失敗したシナリオを読み出せるようにするためです。断り方は互換ルートが封筒の `70001`、`/_control/` が 503 `PERSIST_DEGRADED` です。
 
 **復帰は再起動です。** ディスクを直す → `GET /_control/state` でシナリオを読み出す → 再起動、の順で進めてください。劣化中は市場モードの自動約定も止まります（読むたびにメモリだけ進んで状態ファイルとの差が開くのを避けるため）。
 
@@ -185,21 +186,36 @@ bitbank API には存在しません。本番クライアントから叩かな�
 | `POST` | `/_control/orders/:order_id/fill` | 指定注文を約定。`amount` 省略は残量全部、`price` 省略は指値 |
 | `POST` | `/_control/tick` | `{ pair, price }` または `{ pair, candle }` で人工の足を 1 本適用 |
 | `POST` | `/_control/clock` | 時計（`lastTickAt`）を動かす。本文省略で現在時刻、`{ lastTickAt }` に ISO 文字列かエポックミリ秒。注文・約定・残高は残る（`updatedAt` は書き込み時刻として動きます） |
-| `POST` | `/_control/reset` | 状態を初期化（private stream の接続は close code `1012` で閉じる） |
+| `POST` | `/_control/reset` | 状態を初期化（private stream の接続は close code `1012` で閉じ、保留中なら溜めたものを捨てて保留を解く） |
 | `GET` | `/_control/state` | `PaperState` に、状態ファイルへの書き出しの状況（`persist`）と足の取得の状況（`candles`）を添えて返す |
+| `POST` | `/_control/stream/hold` | private stream の保留を始める。以後の変化のメッセージは送らずに溜める（接続が 0 本でも溜める） |
+| `GET` | `/_control/stream/held` | 保留の状況と、溜めたメッセージを溜めた順に番号（`seq`、1 から）付きで返す |
+| `POST` | `/_control/stream/release` | `{ order: [番号, ...] }` の順に、その時点で接続している全員へ送って保留を解く。`order` 省略は溜めた順にすべて |
+
+**private stream の順序の入れ替わり・重複・欠落は、保留・再送で起こします。** hold してから変化を起こし、held で番号を確かめて、release の `order` に並べます。同じ番号を 2 度書けば重複、書かなかった番号は欠落です。たとえば指値を半分ずつ 2 回約定させる間を保留すれば、`FULLY_FILLED` の `spot_order` の後に `PARTIALLY_FILLED` の `spot_order` を届けられます。
+
+```bash
+curl -s -X POST localhost:14000/_control/stream/hold
+# ……部分約定と全量約定を起こす……
+curl -s localhost:14000/_control/stream/held          # messages[].seq と messages[].frame を見る
+# 部分約定の spot_order が 1 番、全量約定の spot_order が 5 番だったなら、5 → 1 の順に送る（他は欠落）
+curl -s -X POST localhost:14000/_control/stream/release -H 'content-type: application/json' -d '{"order":[5,1]}'
+```
+
+溜めるのは 10,000 通までです。超えた後の変化は溜めずに `overflowed` と `dropped`（落とした通数）を残し、以後の release は 409 で断ります（発注などの状態を変える要求は断りません）。抜け出すのは `POST /_control/reset` です。溜めたものはメモリにだけあり、再起動で消えます。細則は [`docs/fidelity.md`](docs/fidelity.md) の「private stream の保留・再送」の節にあります。
 
 **市場モード（`BITBANK_MOCK_FILL_MODE=market`）で足が取れているかは `GET /_control/state` の `candles` で確かめます。** 取得に失敗しても互換ルートは成功応答を返し続け、失敗した窓は取り直さないので、**約定が無いことだけからは「価格が注文に届いていない」と「足の取得に失敗している」を区別できません**。`lastError`（直近の失敗。成功しても消えません）、`consecutiveFailures`（連続失敗数。今まさに失敗し続けているか）、`lastSuccessAt`（いつまで足が取れていたか。`lastTickAt` と並べて読みます）、`fillMode`（`manual` なら `tick()` はそもそも取りに行きません）を見てください。詳細は [`docs/fidelity.md`](docs/fidelity.md) の「足の取得の健全性」の節にあります。
 
 `POST /_control/tick` が進める `lastTickAt`（control の時計）は、足の `timestamp` でも tick ごとの 60 秒の前進でも、実時刻より先へは 24 時間までしか動きません。超える要求は 400（`CANDLE_TOO_FAR_AHEAD` / `CLOCK_TOO_FAR_AHEAD`）で断り、状態は変えません。戻すのは `POST /_control/clock` です（`reset` と違って注文・約定・残高は残ります）。詳細は [`docs/fidelity.md`](docs/fidelity.md) の「control の時計」の節にあります。
 
-無効時は 404。非ループバックはトークンが一致しない限り 403 です。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `tick` / `clock` / `reset`）が 503 `PERSIST_DEGRADED` になります（`GET /_control/state` は通ります）。**ループバックからはトークン無しで通る**ので、同一ホスト上の他プロセスからの誤操作は防げません。接続元の判定には TCP の対向アドレスだけを使い、`X-Forwarded-For` は見ません（Fastify の `trustProxy` の設定に境界は左右されません。ただし判定を `request.ip` に変えると、`trustProxy` を有効にした瞬間にヘッダの詐称で迂回できるようになります）。`X-Control-Token` はヘッダ行がちょうど 1 本のときだけ受け付けます。
+無効時は 404。非ループバックはトークンが一致しない限り 403 です。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `tick` / `clock` / `reset`）が 503 `PERSIST_DEGRADED` になります（`GET /_control/state` と、状態ファイルに書かない `stream/hold` / `stream/held` / `stream/release` は通ります）。**ループバックからはトークン無しで通る**ので、同一ホスト上の他プロセスからの誤操作は防げません。接続元の判定には TCP の対向アドレスだけを使い、`X-Forwarded-For` は見ません（Fastify の `trustProxy` の設定に境界は左右されません。ただし判定を `request.ip` に変えると、`trustProxy` を有効にした瞬間にヘッダの詐称で迂回できるようになります）。`X-Control-Token` はヘッダ行がちょうど 1 本のときだけ受け付けます。
 
 ## 非目標（Plan A）
 
 - 公式 testnet / 動作保証 / 全 error code の網羅
 - 認証ヘッダの検証、レート制限、注文訂正
 - ダッシュボード、public REST の網羅、PubNub での配信
-- 障害注入（private stream の重複・順序入替・欠落を含む）
+- 障害注入のうち、REST 側（応答が返らない・5xx・429）と、private stream の時間で遅らせる注入・乱数での注入・接続ごとの注入（private stream の重複・順序入替・欠落は `/_control/stream/*` の保留・再送で起こせます）
 
 計画の詳細は [`docs/plan-lab-mock.md`](docs/plan-lab-mock.md) です。
 

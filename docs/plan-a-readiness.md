@@ -71,6 +71,7 @@
 | 再起動をまたぐ永続化 | **一部** | 状態ファイル（`BITBANK_MOCK_STATE_PATH`） | [状態の永続化](fidelity.md#状態の永続化) / [壊れた状態ファイル](fidelity.md#壊れた状態ファイル) / [同一状態ファイルの多重起動](fidelity.md#同一状態ファイルの多重起動) |
 | 失敗の見え方（error code と封筒） | **一部** | 互換ルートは封筒、`/_control/` は素の JSON | [エラーコード](fidelity.md#エラーコード) / [封筒に包まれない応答](fidelity.md#封筒に包まれない応答) / [配列の包み方](fidelity.md#配列の包み方) |
 | 注文・約定・残高の変化の push 受信 | **一部** | `GET /_stream/private`（WebSocket）と `GET /v1/user/subscribe` | [private stream](fidelity.md#private-stream) / [private stream のメッセージ](fidelity.md#private-stream-のメッセージ) / [private stream の発火契機](fidelity.md#private-stream-の発火契機) |
+| push の順序の入れ替わり・重複・欠落を起こす手段 | 対応 | `POST /_control/stream/hold` / `GET /_control/stream/held` / `POST /_control/stream/release` | [private stream の順序](fidelity.md#private-stream-の順序) / [private stream の保留・再送](fidelity.md#private-stream-の保留再送) |
 
 「**一部**」と書いたものは、対応してはいるが**範囲に条件が付く**もの。条件そのものは上の節で読む。
 
@@ -81,7 +82,8 @@
 - **失敗の見え方** — 実装済みのエンドポイントでも、**封筒に包まれない応答が返る経路がある**。
   どの経路がそうなるかは [`fidelity.md` の「封筒に包まれない応答」](fidelity.md#封筒に包まれない応答)にある
 - **push 受信** — **PubNub ではなく素の WebSocket** で配信する。market モードでは誰かが互換ルートか `/_control/` の fill / tick を叩いたときにだけ
-  約定とイベントが起き（互換ルートのうち `GET /v1/user/subscribe` は状態を読まないので例外で、叩いても約定は進まない）、`POST /_control/reset` は接続を閉じる。順序の入れ替わりや重複を起こす手段は無い。
+  約定とイベントが起き（互換ルートのうち `GET /v1/user/subscribe` は状態を読まないので例外で、叩いても約定は進まない）、`POST /_control/reset` は接続を閉じる。**モック自身は順序を入れ替えず、重複も欠落も起こさない**——起こすのは上の表の
+  保留・再送（`/_control/stream/*`）で、指定したとおりにしか起きない（時間で遅らせる注入・乱数での注入は無い）。
   条件は [`fidelity.md` の「private stream の発火契機」](fidelity.md#private-stream-の発火契機)と
   [`fidelity.md` の「private stream と状態の初期化」](fidelity.md#private-stream-と状態の初期化)にある
 
@@ -198,7 +200,7 @@
   [`README.md`](../README.md) の「免責事項」にある
 - 個別の未実装項目の理由は、対応表の
   [認証](fidelity.md#認証) / [レート制限](fidelity.md#レート制限) / [注文訂正](fidelity.md#注文訂正) /
-  [成行注文の価格上限](fidelity.md#成行注文の価格上限) / [private stream の順序](fidelity.md#private-stream-の順序)（障害注入） /
+  [成行注文の価格上限](fidelity.md#成行注文の価格上限) / [private stream の順序](fidelity.md#private-stream-の順序)（時間で遅らせる注入・乱数での注入） /
   [private stream の `spot_order_invalidation`](fidelity.md#private-stream-の-spot_order_invalidation) の各節にある
 
 ## 6. 最初に流すシナリオ

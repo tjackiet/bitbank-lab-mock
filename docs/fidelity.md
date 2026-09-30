@@ -65,6 +65,7 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 
 - [private stream](#private-stream) — WebSocket の口 `GET /_stream/private` を足し、状態の変化を公式と同じ形のメッセージで配信する（改訂前: 口が無く、未登録パスとして HTTP 404 + 封筒 `10000`）
 - [private stream と状態の初期化](#private-stream-と状態の初期化) — `POST /_control/reset` が private stream の接続をすべて close code `1012` で閉じる（HTTP の応答は変えていない）
+- [private stream の保留・再送](#private-stream-の保留再送) — `POST /_control/stream/hold` / `GET /_control/stream/held` / `POST /_control/stream/release` を足し、private stream の順序の入れ替わり・重複・欠落を `/_control/` から起こせるようにした（改訂前: 起こす手段が無く、常に発生順に 1 回ずつ届いた）
 
 ### 永続化と起動
 
@@ -717,7 +718,7 @@ Plan A は認証ヘッダを検証しない。private stream の WebSocket（`/_
 
 ### `/_control/`
 
-`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
+`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`POST /_control/stream/hold`・`GET /_control/stream/held`・`POST /_control/stream/release`（private stream の保留・再送。同じ表の「private stream の保留・再送」節）、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。保留・再送の 3 つは状態ファイルに書かないので劣化中も通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
 
 - **根拠**: 本モック固有
 - **本物との差異**: bitbank API に存在しない
@@ -806,7 +807,7 @@ control 有効時の既定は `BITBANK_MOCK_FILL_MODE=manual`。`store.tick()` �
 - **本物との差異**: 本物の取引所はクライアント側に口座状態の永続化を持たせない
 - **推測**: はい
   - 確認先 **モックの設計判断**: 状態ファイルへの書き出し方（一時ファイル・fsync・rename）と、書き出しに失敗した後に状態を変える要求を断ること
-- **利用側への含意**: 書き込みが成功していれば、2xx を受け取った注文は再起動後も状態ファイルに残る。**ただし 2xx だけでは書き込みの成否を判定できない。** 書き込みに失敗したとき（ディスク不足・権限など）、`persist()` は `persist failed: ...` を warn ログへ出すだけで throw せず、ルートは 2xx を返す。応答を返した注文が再起動後に消える経路がここに残る。**一度でも書き出しに失敗すると、以後は状態を変える要求を断る**（`BITBANK_MOCK_PERSIST_FAILURE`、既定 `degrade`。**v0.1.0 からの改訂**。`docs/plan-lab-mock.md` 10.5 の決定）。断るのは発注・取消・`/_control/` の fill / tick / clock / reset で、照会（`GET order` / `orders_info` / `active_orders` / `trade_history` / `assets` / `GET /_control/state`）は通す。失敗したシナリオを読み出せることを優先している。互換ルートは封筒 + `70001`（`INTERNAL`）、`/_control/` は素の JSON + 503 `PERSIST_DEGRADED`。**書き込みに失敗した当の要求も断るが、巻き戻さない**ので、その注文はメモリに残り照会から見つかる（応答は失敗・状態には在る、という非対称。巻き戻すと合流した書き込みの分まで捨てるため）。再送は断られるので二重注文にはならない。**劣化中は market モードの自動約定も止める**（読み取りは通すので、止めないと読むたびにメモリだけ進んで状態ファイルとの差が開く）。**復帰手段は用意していない**（ディスクを直す → `GET /_control/state` で読み出す → 再起動）。`BITBANK_MOCK_PERSIST_FAILURE=ignore` で v0.1.0 の挙動に戻る。判定には `GET /_control/state` の `persist` を使う（`lastError` が直近の失敗の時刻とメッセージ、`consecutiveFailures` が連続失敗数。`lastError` は成功しても消さないので「一度でも失敗したか」が残り、「今まさに失敗し続けているか」は `consecutiveFailures > 0` で見る）。警告のメッセージは JSON で包む（fs のエラーがパスを生のまま含むため。同じ行の `state dir fsync failed` と同じ扱い）。耐久性の範囲は `rename` の後に親ディレクトリを fsync するところまでで、**OS ごと落ちた場合も差し替えは残る**（v0.1.0 からの改訂。`docs/plan-lab-mock.md` 10 節の PR 1）。ただしディレクトリの fsync が失敗する環境では warn を出して成功のまま返すので、**その環境に限っては保証がプロセスの再起動までに戻る**。実験中はこの warn も監視する
+- **利用側への含意**: 書き込みが成功していれば、2xx を受け取った注文は再起動後も状態ファイルに残る。**ただし 2xx だけでは書き込みの成否を判定できない。** 書き込みに失敗したとき（ディスク不足・権限など）、`persist()` は `persist failed: ...` を warn ログへ出すだけで throw せず、ルートは 2xx を返す。応答を返した注文が再起動後に消える経路がここに残る。**一度でも書き出しに失敗すると、以後は状態を変える要求を断る**（`BITBANK_MOCK_PERSIST_FAILURE`、既定 `degrade`。**v0.1.0 からの改訂**。`docs/plan-lab-mock.md` 10.5 の決定）。断るのは発注・取消・`/_control/` の fill / tick / clock / reset で、照会（`GET order` / `orders_info` / `active_orders` / `trade_history` / `assets` / `GET /_control/state`）は通す。失敗したシナリオを読み出せることを優先している。状態ファイルに書かない `/_control/stream/*`（private stream の保留・再送）も通す（下の「private stream の保留・再送」節）。互換ルートは封筒 + `70001`（`INTERNAL`）、`/_control/` は素の JSON + 503 `PERSIST_DEGRADED`。**書き込みに失敗した当の要求も断るが、巻き戻さない**ので、その注文はメモリに残り照会から見つかる（応答は失敗・状態には在る、という非対称。巻き戻すと合流した書き込みの分まで捨てるため）。再送は断られるので二重注文にはならない。**劣化中は market モードの自動約定も止める**（読み取りは通すので、止めないと読むたびにメモリだけ進んで状態ファイルとの差が開く）。**復帰手段は用意していない**（ディスクを直す → `GET /_control/state` で読み出す → 再起動）。`BITBANK_MOCK_PERSIST_FAILURE=ignore` で v0.1.0 の挙動に戻る。判定には `GET /_control/state` の `persist` を使う（`lastError` が直近の失敗の時刻とメッセージ、`consecutiveFailures` が連続失敗数。`lastError` は成功しても消さないので「一度でも失敗したか」が残り、「今まさに失敗し続けているか」は `consecutiveFailures > 0` で見る）。警告のメッセージは JSON で包む（fs のエラーがパスを生のまま含むため。同じ行の `state dir fsync failed` と同じ扱い）。耐久性の範囲は `rename` の後に親ディレクトリを fsync するところまでで、**OS ごと落ちた場合も差し替えは残る**（v0.1.0 からの改訂。`docs/plan-lab-mock.md` 10 節の PR 1）。ただしディレクトリの fsync が失敗する環境では warn を出して成功のまま返すので、**その環境に限っては保証がプロセスの再起動までに戻る**。実験中はこの warn も監視する
 
 ### 同一状態ファイルの多重起動
 
@@ -859,7 +860,7 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream
 
-**素の WebSocket で配信する（PubNub を模さない）。** 接続先は `ws://<host>:<port>/_stream/private`（listen アドレスとポートは互換ルートと同じ）。`GET /v1/user/subscribe` は公式と同じ形 `{ "success": 1, "data": { "pubnub_channel", "pubnub_token" } }` を返すが、**値はダミーの固定文字列**で、WebSocket の接続ではどちらも見ない。送るメソッドは現物の 4 つ（`spot_order_new` / `spot_order` / `spot_trade` / `asset_update`）で、`spot_order_invalidation` は送らない（下の「private stream の `spot_order_invalidation`」節）。**接続した時点の状態は送らない**——接続の後に起きた変化だけが届く。クライアントから送られたフレームは読まずに捨て、1024 バイトを超えるフレームには close code `1009` で閉じる。upgrade でない `GET /_stream/private` には HTTP `426` と素の JSON `{"error":"UPGRADE_REQUIRED"}` を返す
+**素の WebSocket で配信する（PubNub を模さない）。** 接続先は `ws://<host>:<port>/_stream/private`（listen アドレスとポートは互換ルートと同じ）。`GET /v1/user/subscribe` は公式と同じ形 `{ "success": 1, "data": { "pubnub_channel", "pubnub_token" } }` を返すが、**値はダミーの固定文字列**で、WebSocket の接続ではどちらも見ない。送るメソッドは現物の 4 つ（`spot_order_new` / `spot_order` / `spot_trade` / `asset_update`）で、`spot_order_invalidation` は送らない（下の「private stream の `spot_order_invalidation`」節）。**接続した時点の状態は送らない**——接続の後に起きた変化だけが届く（**例外は保留・再送**で、保留の後に繋いだ接続にも、release で繋ぐ前の変化が届く。下の「private stream の保留・再送」節）。クライアントから送られたフレームは読まずに捨て、1024 バイトを超えるフレームには close code `1009` で閉じる。upgrade でない `GET /_stream/private` には HTTP `426` と素の JSON `{"error":"UPGRADE_REQUIRED"}` を返す
 
 - **根拠**: 公式 private stream（`private-stream.md`）のメッセージ形と、REST の Get channel and token for private stream（`rest-api.md:1772-1824` / `rest-api_JP.md:1785-1790`。フィールドは `pubnub_channel` / `pubnub_token` の 2 つ、チャンネルはユーザーごと、トークンの TTL は 12 時間）。トランスポートの決定は計画書 3.4（2026-09-11）
 - **本物との差異**: 接続・配信のトランスポートが異なる（公式は PubNub SDK で購読する）。チャンネル名とトークンを検証せず、トークンの期限切れ（公式は 12 時間で切断）も起こさない。`GET /v1/user/subscribe` は**`store.tick()` を呼ばない唯一の互換ルート**で、状態を読まない（tick すると、再接続の手順の途中のまだ繋がっていない窓で約定のイベントが流れて取りこぼされるため。`src/routes/subscribe.ts`）。`/_stream/private` は bitbank API に存在しない口で、認証も接続元の制限も無い（互換ルートと同じ扱い。上の「認証」節）
@@ -870,7 +871,7 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream のメッセージ
 
-1 フレームに JSON 1 つで、形は公式と同じ `{ "message": { "method": ..., "params": [...] } }`。**`params` は常に要素 1 つの配列**にし、1 回の状態の変化につき、変わった注文・新しい約定・見え方が変わった資産ごとに 1 通ずつ送る。**1 回の変化の中は注文 → 約定 → 資産の順**に並べる（例: 指値の部分約定は `spot_order` → `spot_trade` → `asset_update` を資産の数だけ）。同じメッセージを 2 度送ることはない
+1 フレームに JSON 1 つで、形は公式と同じ `{ "message": { "method": ..., "params": [...] } }`。**`params` は常に要素 1 つの配列**にし、1 回の状態の変化につき、変わった注文・新しい約定・見え方が変わった資産ごとに 1 通ずつ送る。**1 回の変化の中は注文 → 約定 → 資産の順**に並べる（例: 指値の部分約定は `spot_order` → `spot_trade` → `asset_update` を資産の数だけ）。モックが自分から同じメッセージを 2 度送ることはない（重複は `/_control/` の保留・再送で指定したときだけ起きる。下の「private stream の保留・再送」節）
 
 - **根拠**: 公式の応答例（`private-stream.md:89-107` ほか）はいずれも `params` を配列にして要素を 1 つだけ書く（`spot_order_invalidation` だけはオブジェクト。下の同名の節）。公式の例のコード（`private-stream.md:666` / `private-stream_JP.md:667`）は `data.message.params[0]` だけを読む
 - **本物との差異**: **実 API が 1 通に複数の要素を詰めるかは確かめていない**（受信には実弾の口座と PubNub 接続が要る）。1 回の変化の中の並べ方はモックの決め事で、公式は順序を保証しない（下の「private stream の順序」節）
@@ -906,7 +907,7 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream の発火契機
 
-**状態が変わるたびに、その変化を送る。** 送る内容は変化の前後の状態の差から作るので（`src/stream/events.ts`）、経路を問わない——互換ルートの発注・取消・一括取消、`/_control/` の fill / tick、**market モードの `tick()` が埋めた約定**のどれでも同じように流れる。**market モードでは読み取りの要求（`GET /v1/user/assets` など）が約定を起こし、そのイベントが流れる**。足による自動の約定を起こすのは `store.tick()` を通る互換ルートで、**`GET /v1/user/subscribe` だけは例外**である（状態を読まないので tick を通らない。上の「private stream」節）。control を有効にしていれば、`/_control/` の fill / tick も market モードのまま約定を起こし、同じようにイベントが流れる。裏で足を見張る仕組みは無いので、**互換ルートにも `/_control/` にも要求が来ない間は約定もイベントも起きない**。manual モードでは、互換ルートの状態を変える要求と `/_control/` の操作でだけ流れる。時計だけを動かす変化（`POST /_control/clock`、tick の末尾の時計の前進）は何も流さない
+**状態が変わるたびに、その変化を送る**（`/_control/stream/hold` で保留している間は送らずに溜める。下の「private stream の保留・再送」節）。送る内容は変化の前後の状態の差から作るので（`src/stream/events.ts`）、経路を問わない——互換ルートの発注・取消・一括取消、`/_control/` の fill / tick、**market モードの `tick()` が埋めた約定**のどれでも同じように流れる。**market モードでは読み取りの要求（`GET /v1/user/assets` など）が約定を起こし、そのイベントが流れる**。足による自動の約定を起こすのは `store.tick()` を通る互換ルートで、**`GET /v1/user/subscribe` だけは例外**である（状態を読まないので tick を通らない。上の「private stream」節）。control を有効にしていれば、`/_control/` の fill / tick も market モードのまま約定を起こし、同じようにイベントが流れる。裏で足を見張る仕組みは無いので、**互換ルートにも `/_control/` にも要求が来ない間は約定もイベントも起きない**。manual モードでは、互換ルートの状態を変える要求と `/_control/` の操作でだけ流れる。時計だけを動かす変化（`POST /_control/clock`、tick の末尾の時計の前進）は何も流さない
 
 - **根拠**: 本モック固有（計画書 16 節の決定 13）。公式の約定は市場が動いたときに起き、利用者の要求とは無関係に通知される
 - **本物との差異**: **発火の契機がモック固有**——本物は市場が動いたときに飛ぶが、market モードのモックは「誰かが互換ルート（`GET /v1/user/subscribe` を除く）か `/_control/` の fill / tick を叩いたとき」に飛ぶ。manual モードでは約定は `/_control/` を叩いた時点でだけ起きる
@@ -916,7 +917,7 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream と永続化の失敗
 
-**イベントはメモリへ反映した直後に送り、書き出しの成否も HTTP 応答も待たない。** そのため (a) 発注の HTTP 応答より先に `spot_order_new` が届くことがあり、(b) 書き出しに失敗して `70001` を返した要求（劣化の引き金になった 1 本）のイベントも流れる。劣化した後は状態を変える要求が断られ `tick()` も止まるので、**以後は何も流れない**（接続は断らない。`GET /_stream/private` は劣化中も通す読み取り経路に入れてある）
+**イベントはメモリへ反映した直後に送り、書き出しの成否も HTTP 応答も待たない。** そのため (a) 発注の HTTP 応答より先に `spot_order_new` が届くことがあり、(b) 書き出しに失敗して `70001` を返した要求（劣化の引き金になった 1 本）のイベントも流れる。劣化した後は状態を変える要求が断られ `tick()` も止まるので、**以後は何も流れない**（接続は断らない。`GET /_stream/private` は劣化中も通す読み取り経路に入れてある）。保留中だった場合、劣化の前に溜めたもの（(b) の 1 本のイベントを含む）は**劣化中も release で取り出せる**（保留・再送の 3 つは劣化中も通す。下の「private stream の保留・再送」節）
 
 - **根拠**: 本モック固有（計画書 16 節の決定 14）。書き出しの失敗の扱いそのものは上の「状態の永続化」節
 - **本物との差異**: 本物に対応する概念が無い。HTTP 応答と stream の到着順は、公式も何も保証していない
@@ -926,7 +927,7 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream と状態の初期化
 
-`POST /_control/reset` は**イベントを 1 つも送らず、接続中の private stream をすべて close code `1012`（Service Restart）で閉じる**（reason は `state reset by /_control/reset`）。reset の後に繋ぎ直した接続には、以後の変化が通常どおり届く
+`POST /_control/reset` は**イベントを 1 つも送らず、接続中の private stream をすべて close code `1012`（Service Restart）で閉じる**（reason は `state reset by /_control/reset`）。reset の後に繋ぎ直した接続には、以後の変化が通常どおり届く。**保留中なら溜めたものを捨て、保留も解く**（前の注文のメッセージを、id を配り直した後に届けないため。前の実験で保留を解き忘れていても、シナリオの冒頭の reset で通常の配信に戻る。下の「private stream の保留・再送」節）
 
 - **根拠**: 本モック固有。reset は bitbank API に無い操作で、公式にも「状態が丸ごと入れ替わった」を表すメソッドは無い
 - **本物との差異**: 本物に対応する操作が無い
@@ -936,13 +937,41 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream の順序
 
-**モック自身は順序を入れ替えず、重複も欠落も起こさない**（1 回の変化の中の並び方は上の「private stream のメッセージ」節）。公式が順序を保証しないことに利用側が耐えるかを試すための差し込み口（`DeliveryPolicy`、`src/stream/hub.ts`）を配信の直前に置いてあるが、**Plan A では恒等写像で、外から切り替える手段は無い**
+**モック自身は順序を入れ替えず、重複も欠落も起こさない**（1 回の変化の中の並び方は上の「private stream のメッセージ」節）。**入れ替わり・重複・欠落は `/_control/` の保留・再送で狙って起こせる**（下の「private stream の保留・再送」節）。配信の直前には差し込み口（`DeliveryPolicy`、`src/stream/hub.ts`）も置いてあるが、1 回の変化の中しか並べ替えられず（全量約定の後に前の部分約定の通知を届ける、という変化をまたいだ入れ替えは作れない）、既定の恒等写像を外から切り替える口は無い
 
 - **根拠**: 公式の例のコードのコメントが順序を保証しないと明記している（`private-stream.md:659` "Since message order is not guaranteed, ..." / `private-stream_JP.md:660`「メッセージの順序は保証されないため」）。**改訂前はここに「順序保証の記載なし」と書いていたが、例のコードのコメントを読み落としていた**（2026-09-27 に訂正）。重複の有無については公式に記述が無い
-- **本物との差異**: モックは常に発生順・重複なしで届けるので、**本物で起こり得る順序の入れ替わりを踏めない**。障害注入（重複・順序入替・欠落）は計画書 3.4 のとおり Plan B
+- **本物との差異**: モックは何もしなければ常に発生順・重複なしで届けるので、**本物で起こり得る順序の入れ替わりは、`/_control/` から起こさない限り踏めない**。本物では、いつ・どれが入れ替わるかを利用者が選べない。起こす口は計画書 3.4 では Plan B に置いていたが、計画書 17 節で Plan A へ前倒しした（時間で遅らせる注入・乱数での注入は入れていない。計画書 17.4）
 - **推測**: はい
   - 確認先 **実 API**: 実 API の private stream は、同じメッセージを重複して届けることがありますか
-- **利用側への含意**: 利用側は順不同・重複を許容して状態を解釈する（公式の例のコードのように、`status` の段階と `remaining_amount` で「進んだときだけ上書きする」）。**このモックで順序が保たれていることを契約として学習しないこと**
+- **利用側への含意**: 利用側は順不同・重複を許容して状態を解釈する（公式の例のコードのように、`status` の段階と `remaining_amount` で「進んだときだけ上書きする」）。**このモックで順序が保たれていることを契約として学習しないこと**。耐えることは保留・再送で入れ替わり・重複・欠落を起こして確かめる
+
+### private stream の保留・再送
+
+**`/_control/` から、private stream の順序の入れ替わり・重複・欠落を狙って起こせる。** `POST /_control/stream/hold` の後に起きた変化のメッセージは送らずに溜め（**購読者が 0 人でも溜める**）、`GET /_control/stream/held` が溜めた順に番号 `seq`（1 から）を付けて返し、`POST /_control/stream/release` が本文 `{ "order": [番号, ...] }` の順に送って保留を解く。**同じ番号を 2 度書けば重複、書かなかった番号は欠落**になり、`order` を省略すると（本文の省略・`{}` を含む）溜めた順にすべて送る。release の後は通常の配信に戻る
+
+| 口 | 応答 |
+| --- | --- |
+| `POST /_control/stream/hold` | `{ holding, held, limit, overflowed, dropped }`（保留の状況）。**既に保留中なら何もしない**（溜めたものも番号も保つ）。本文は読まない |
+| `GET /_control/stream/held` | 保留の状況に `messages: [{ seq, frame }]` を足したもの。`frame` は WebSocket の 1 フレームに載る JSON そのもの。保留していなければ `holding: false` で `messages` は空 |
+| `POST /_control/stream/release` | `{ sent, omitted, clients }`（送った通数〔重複の分も数える〕・指定しなかった番号・送った時点の接続数） |
+
+- **送る相手は release の時点で接続している全員**で、接続ごとに変えない。**保留の後に繋いだ接続にも、繋ぐ前の変化が届く**——上の「private stream」節の「接続した後の変化だけが届く」の**例外**である。購読者が 0 人でも release は断らず、溜めたものは誰にも届かずに消える（応答の `clients` が `0`）
+- 溜めるのは配信方針（`DeliveryPolicy`）を通した後の列で、release では通さない。時計だけの変化のようにメッセージを作らない変化は溜めない
+- **上限は 10,000 通**（`src/stream/hub.ts` の `DEFAULT_HOLD_LIMIT`。環境変数では変えられない）。1 回の変化のメッセージが入りきらなければ**その変化は丸ごと溜めず**、`overflowed: true` を立て、そこから先の変化もすべて溜めずに通数を `dropped` に数える（溢れた最初の 1 回だけ warn を出す）。**溢れた後の release は 409 `{"error":"STREAM_HOLD_OVERFLOWED","limit":…,"dropped":…}`** で断る。**状態を変える要求そのものは断らない**。抜け出すのは `POST /_control/reset`（上の「private stream と状態の初期化」節）
+- 保留していないときの release は 409 `{"error":"NOT_HOLDING"}`。本文がオブジェクトでない・`order` が数値の配列でない（`"1"` を数へ強制しない）・番号が整数でないか 1〜溜めた数の範囲外・並びが上限より長い、のいずれかは 400 `{"error":"INVALID_RELEASE_ORDER","held":…,"limit":…}`。本文の形（オブジェクトか・数値の配列か）の検査は保留の有無より先に行う。**断ったときは保留も溜めたものもそのまま残す**
+- 溜めたものと保留中かどうかは hub のメモリにだけあり、`PaperState` にも状態ファイルにも入らない（`GET /_control/state` にも出ない）。**再起動で消える**。状態ファイルに書かないので、書き出しに失敗した後の劣化中も 3 つとも通す（上の「private stream と永続化の失敗」節）
+- 無効時・非ループバックの扱いは他の `/_control/` と同じ（上の「`/_control/`」節・「control のアクセス境界」節）
+
+**上限を 10,000 通にした理由**: 手で組む入れ替えのシナリオ（多くて数十通）に十分な余白を残しつつ、利用側のエージェントを保留したまま走らせる実験（1 回の発注で 2〜4 通）でも数千回の発注まで収まるようにした。1 通は数百バイトなので、溜めきっても数 MB で済む
+
+- **根拠**: 本モック固有（計画書 17 節の要判断事項 18〜23）。公式が順序を保証しないことは上の「private stream の順序」節
+- **本物との差異**: bitbank API に存在しない口。本物の入れ替わり・重複・欠落は、いつ・どれが起きるかを利用者が選べないが、モックは release で指定したとおりにしか起こさない。時間で遅らせる注入・乱数での注入・接続ごとの注入は無い（計画書 17.4）
+- **推測**: はい
+  - 確認先 **モックの設計判断**: 保留中は購読者が 0 人でも溜め、release はその時点で接続している全員へ送ること（保留の後に繋いだ接続にも、繋ぐ前の変化が届く）
+  - 確認先 **モックの設計判断**: 上限（10,000 通）に達したら以後の変化を溜めずに印と落とした通数を残し、release を断り、状態を変える要求は断らないこと
+  - 確認先 **モックの設計判断**: reset で溜めたものを捨て、保留も解くこと
+  - 確認先 **モックの設計判断**: 書き出しに失敗した後の劣化中も hold / held / release を通すこと
+- **利用側への含意**: 「単調性」と「終端の優先」は、部分約定と全量約定の間で保留して release の並びを入れ替える（`FULLY_FILLED` の `spot_order` の後に `PARTIALLY_FILLED` の `spot_order`）か、同じ番号を 2 度書いて踏む。「fail-closed」は保留したまま release しない間に踏める（stream は届かないが、REST の照合と状態を変える要求は通る）。利用側が止まっている間の変化は、切断中に保留して変化を起こし、繋ぎ直してから release すれば届けられる（**繋ぐ前に release すると誰にも届かない**。応答の `clients` を見る）。溢れたら reset からやり直す。シナリオの冒頭で reset すれば、前の実験で解き忘れた保留は持ち越さない
 
 ### private stream の `asset_update` のキー
 

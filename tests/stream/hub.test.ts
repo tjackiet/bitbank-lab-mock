@@ -4,6 +4,7 @@ import { placeOrder } from "../../src/engine/transitions.ts";
 import { SessionStore } from "../../src/store/session.ts";
 import { type PrivateStreamMessage, stateChangeMessages } from "../../src/stream/events.ts";
 import {
+  DEFAULT_HOLD_LIMIT,
   type DeliveryPolicy,
   PrivateStreamHub,
   RESET_CLOSE_CODE,
@@ -209,5 +210,287 @@ describe("PrivateStreamHub", () => {
     hub.stop();
     store.replace(placed(store.state()));
     expect(r.sent).toHaveLength(2);
+  });
+});
+
+/** 保留・再送（`hold()` / `heldMessages()` / `release()`）。 */
+describe("PrivateStreamHub の保留・再送", () => {
+  /** 保留した hub。`place()` は発注 1 回ぶんの差し替え（`spot_order_new` と `asset_update` の 2 通）。 */
+  function held(opts: { holdLimit?: number; deliveryPolicy?: DeliveryPolicy } = {}) {
+    const warnings: string[] = [];
+    const store = newStore();
+    const hub = new PrivateStreamHub(store, {
+      assetKeys: "camel",
+      logger: { warn: (m) => warnings.push(m), info: () => {} },
+      ...opts,
+    });
+    hub.start();
+    const place = () => {
+      const prev = store.state();
+      const next = placed(prev);
+      store.replace(next);
+      return stateChangeMessages(prev, next, { feeRate: 0, assetKeys: "camel" });
+    };
+    return { store, hub, place, warnings };
+  }
+
+  it("保留中は送らずに溜め、溜めた順に 1 から番号を振る", () => {
+    const { hub, place } = held();
+    const r = recorder();
+    hub.addClient(r.client);
+    expect(hub.hold()).toEqual({
+      holding: true,
+      held: 0,
+      limit: DEFAULT_HOLD_LIMIT,
+      overflowed: false,
+      dropped: 0,
+    });
+
+    const first = place();
+    const second = place();
+    expect(r.sent).toEqual([]);
+    expect(hub.heldMessages()).toEqual(
+      [...first, ...second].map((frame, i) => ({ seq: i + 1, frame })),
+    );
+    expect(hub.holdStatus()).toMatchObject({ holding: true, held: 4 });
+  });
+
+  it("保留していなければ状況は空で、溜めたものも無い", () => {
+    const { hub } = held({ holdLimit: 5 });
+    expect(hub.holdStatus()).toEqual({
+      holding: false,
+      held: 0,
+      limit: 5,
+      overflowed: false,
+      dropped: 0,
+    });
+    expect(hub.heldMessages()).toEqual([]);
+  });
+
+  it("購読者が 0 人でも保留中は溜め、release の時点で繋がっている購読者へ届ける", () => {
+    const { hub, place } = held();
+    hub.hold();
+    const messages = place();
+    expect(hub.holdStatus().held).toBe(messages.length);
+
+    // 保留の後に繋いだ購読者にも、繋ぐ前の変化が届く（「接続した後の変化だけ」の例外）。
+    const r = recorder();
+    hub.addClient(r.client);
+    const res = hub.release();
+    expect(res).toEqual({
+      success: true,
+      data: { sent: messages.length, omitted: [], clients: 1 },
+    });
+    expect(r.sent).toEqual(messages);
+  });
+
+  it("hold を 2 回呼んでも溜めたものを捨てず、番号も振り直さない", () => {
+    const { hub, place } = held();
+    hub.hold();
+    const first = place();
+    expect(hub.hold()).toMatchObject({ holding: true, held: first.length });
+    place();
+    expect(hub.heldMessages().map((m) => m.seq)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("order を省略した release は溜めた順に全員へ送り、以後は通常の配信に戻る", () => {
+    const { hub, place } = held();
+    const a = recorder();
+    const b = recorder();
+    hub.addClient(a.client);
+    hub.addClient(b.client);
+    hub.hold();
+    const messages = place();
+
+    expect(hub.release()).toEqual({
+      success: true,
+      data: { sent: 2, omitted: [], clients: 2 },
+    });
+    expect(a.sent).toEqual(messages);
+    expect(b.sent).toEqual(messages);
+    expect(hub.holdStatus().holding).toBe(false);
+    expect(hub.heldMessages()).toEqual([]);
+
+    const after = place();
+    expect(a.sent).toEqual([...messages, ...after]);
+  });
+
+  it("order の番号の順に送る。同じ番号を 2 度書けば重複、書かなければ欠落", () => {
+    const { hub, place } = held();
+    const r = recorder();
+    hub.addClient(r.client);
+    hub.hold();
+    const frames = [...place(), ...place()];
+
+    const res = hub.release([4, 1, 1]);
+    expect(res).toEqual({ success: true, data: { sent: 3, omitted: [2, 3], clients: 1 } });
+    expect(r.sent).toEqual([frames[3], frames[0], frames[0]]);
+  });
+
+  it("空の order は何も送らずに溜めたものをすべて捨て、保留を解く", () => {
+    const { hub, place } = held();
+    const r = recorder();
+    hub.addClient(r.client);
+    hub.hold();
+    place();
+    expect(hub.release([])).toEqual({
+      success: true,
+      data: { sent: 0, omitted: [1, 2], clients: 1 },
+    });
+    expect(r.sent).toEqual([]);
+    expect(hub.holdStatus().holding).toBe(false);
+  });
+
+  it("購読者が 0 人でも release は断らず、clients: 0 を返す", () => {
+    const { hub, place } = held();
+    hub.hold();
+    place();
+    expect(hub.release()).toEqual({
+      success: true,
+      data: { sent: 2, omitted: [], clients: 0 },
+    });
+    expect(hub.holdStatus().holding).toBe(false);
+  });
+
+  it("保留していなければ release は NOT_HOLDING で断る", () => {
+    const { hub } = held();
+    expect(hub.release()).toEqual({ success: false, error: "NOT_HOLDING" });
+  });
+
+  it.each([
+    { name: "0 番", order: [0] },
+    { name: "溜めた数を超える番号", order: [3] },
+    { name: "負の番号", order: [-1] },
+    { name: "整数でない番号", order: [1.5] },
+    { name: "NaN", order: [Number.NaN] },
+    { name: "上限より長い並び", order: [1, 1, 1, 1] },
+  ])("$name を含む order は INVALID_ORDER で断り、保留も溜めたものも残す", ({ order }) => {
+    const { hub, place } = held({ holdLimit: 3 });
+    const r = recorder();
+    hub.addClient(r.client);
+    hub.hold();
+    const frames = place();
+    const before = hub.heldMessages();
+
+    expect(hub.release(order)).toEqual({ success: false, error: "INVALID_ORDER" });
+    expect(r.sent).toEqual([]);
+    expect(hub.heldMessages()).toEqual(before);
+    expect(hub.release([1, 2])).toMatchObject({ success: true });
+    expect(r.sent).toEqual(frames);
+  });
+
+  it("配信方針を通した後の列を溜める", () => {
+    const policy: DeliveryPolicy = (ms) => [...ms].reverse();
+    const { hub, place } = held({ deliveryPolicy: policy });
+    hub.hold();
+    place();
+    expect(hub.heldMessages().map((m) => m.frame.message.method)).toEqual([
+      "asset_update",
+      "spot_order_new",
+    ]);
+  });
+
+  it("メッセージを作らない変化（時計だけ）は溜めず、溢れの判定にも数えない", () => {
+    const { store, hub } = held({ holdLimit: 1 });
+    hub.hold();
+    store.replace({ ...store.state(), lastTickAt: "2026-01-02T00:00:00.000Z" });
+    expect(hub.holdStatus()).toMatchObject({ held: 0, overflowed: false, dropped: 0 });
+  });
+
+  it("入りきらない変化は丸ごと溜めず、印と落とした通数を残し、以後の変化もすべて落とす", () => {
+    const { store, hub, place, warnings } = held({ holdLimit: 3 });
+    const r = recorder();
+    hub.addClient(r.client);
+    hub.hold();
+    const first = place(); // 2 通。上限 3 に収まる
+    place(); // 2 通。合わせて 4 通で入りきらない
+    expect(hub.holdStatus()).toEqual({
+      holding: true,
+      held: 2,
+      limit: 3,
+      overflowed: true,
+      dropped: 2,
+    });
+    expect(hub.heldMessages().map((m) => m.frame)).toEqual(first);
+
+    // 1 通だけの変化なら上限に収まるが、溢れた後は溜めない（途中だけ抜けた列を作らない）。
+    store.replace({ ...store.state(), balances: { ...store.state().balances, jpy: 1 } });
+    expect(hub.holdStatus()).toMatchObject({ held: 2, dropped: 3 });
+    expect(r.sent).toEqual([]);
+    // 警告は溢れた最初の 1 回だけ。
+    expect(warnings).toEqual([
+      "private stream: hold buffer is full (limit 3); later messages are dropped and release is refused until POST /_control/reset",
+    ]);
+  });
+
+  it("溢れた後の release は OVERFLOWED で断り、保留も溜めたものも残す", () => {
+    const { hub, place } = held({ holdLimit: 2 });
+    hub.hold();
+    place();
+    place();
+    expect(hub.release()).toEqual({ success: false, error: "OVERFLOWED" });
+    expect(hub.release([1])).toEqual({ success: false, error: "OVERFLOWED" });
+    expect(hub.holdStatus()).toMatchObject({ holding: true, held: 2, overflowed: true });
+  });
+
+  it("溢れを知らせる警告が投げても、印と落とした通数は残る", () => {
+    const store = newStore();
+    const hub = new PrivateStreamHub(store, {
+      assetKeys: "camel",
+      holdLimit: 1,
+      logger: {
+        warn: () => {
+          throw new Error("EPIPE");
+        },
+        info: () => {},
+      },
+    });
+    hub.start();
+    hub.hold();
+    const next = placed(store.state());
+    store.replace(next);
+    expect(store.state()).toBe(next);
+    expect(hub.holdStatus()).toMatchObject({ held: 0, overflowed: true, dropped: 2 });
+  });
+
+  it("reset は溜めたものを捨てて保留を解き、購読者を閉じる", async () => {
+    const { store, hub, place } = held({ holdLimit: 2 });
+    const r = recorder();
+    hub.addClient(r.client);
+    hub.hold();
+    place();
+    place(); // 溢れさせても reset で抜け出せる
+    expect(hub.holdStatus().overflowed).toBe(true);
+
+    await store.reset(buildState());
+    expect(r.closed).toEqual([{ code: RESET_CLOSE_CODE, reason: RESET_CLOSE_REASON }]);
+    expect(r.sent).toEqual([]);
+    expect(hub.holdStatus()).toEqual({
+      holding: false,
+      held: 0,
+      limit: 2,
+      overflowed: false,
+      dropped: 0,
+    });
+
+    // 繋ぎ直した購読者には、以後の変化が通常どおり届く。
+    const again = recorder();
+    hub.addClient(again.client);
+    const after = place();
+    expect(again.sent).toEqual(after);
+  });
+
+  it("購読者が 0 人でも reset は保留を解く", async () => {
+    const { store, hub, place } = held();
+    hub.hold();
+    place();
+    await store.reset(buildState());
+    expect(hub.holdStatus().holding).toBe(false);
+  });
+
+  it.each([0, -1, 1.5, Number.NaN])("holdLimit に %s は渡せない", (holdLimit) => {
+    expect(() => new PrivateStreamHub(newStore(), { assetKeys: "camel", holdLimit })).toThrow(
+      RangeError,
+    );
   });
 });

@@ -14,7 +14,7 @@ import { tradeHistoryRoutes } from "../routes/trade-history.ts";
 import type { SessionStore } from "../store/session.ts";
 import { type DeliveryPolicy, PrivateStreamHub } from "../stream/hub.ts";
 import { controlToken, isControlEnabled, streamAssetKeys } from "./config.ts";
-import { assertRouteClassified, degradedResponse, isReadRoute } from "./degraded.ts";
+import { assertRouteClassified, degradedResponse, passesWhileDegraded } from "./degraded.ts";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -32,6 +32,11 @@ export type BuildServerOptions = {
   streamAssetKeys?: AssetKeyStyle;
   /** 省略時は `passThrough`（恒等写像）。障害注入の差し込み口（`src/stream/hub.ts`）。 */
   deliveryPolicy?: DeliveryPolicy;
+  /**
+   * 保留中に溜める通数の上限。省略時は `DEFAULT_HOLD_LIMIT`（`src/stream/hub.ts`）。
+   * **環境変数では変えられない**——溢れる筋をテストが HTTP 越しに踏むためだけにある。
+   */
+  streamHoldLimit?: number;
 };
 
 /**
@@ -72,7 +77,7 @@ function registerDegradedGuard(fastify: FastifyInstance, store: SessionStore): v
   const refusalUrl = (request: FastifyRequest): string | undefined => {
     const url = request.routeOptions.url;
     if (url === undefined) return undefined;
-    return store.isDegraded() && !isReadRoute(request.method, url) ? url : undefined;
+    return store.isDegraded() && !passesWhileDegraded(request.method, url) ? url : undefined;
   };
 
   fastify.addHook("preHandler", async (request, reply) => {
@@ -148,6 +153,7 @@ function registerPrivateStream(
     assetKeys: opts.streamAssetKeys ?? streamAssetKeys(),
     deliveryPolicy: opts.deliveryPolicy,
     logger: fastify.log,
+    holdLimit: opts.streamHoldLimit,
   });
   hub.start();
   fastify.addHook("onClose", async () => hub.stop());
