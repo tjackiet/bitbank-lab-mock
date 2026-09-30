@@ -95,6 +95,18 @@ export type PaperState = z.infer<typeof PaperStateSchema>;
 // bitbank 公称テイカー手数料 0.12% (https://bitbank.cc/docs/fees/)
 export const DEFAULT_TAKER_FEE_RATE = 0.0012;
 
+/**
+ * 実時刻の ISO 文字列。
+ *
+ * **`SessionStore.now()`（状態に記録する時刻の出どころ）へは寄せず、実時刻のまま残す。**
+ * 呼び出し元は 2 つで、どちらも実時刻が正しい。
+ *
+ * - `freshState()`: reset で時計は実時刻に戻る（`docs/plan-lab-mock.md` 17.2 の決定 25）。
+ *   状態ファイルが無いときの初期状態も同じく実時刻から始める
+ * - 書き出し失敗の記録時刻（`SessionStore` の `persistHealth()` の `lastError.at`）: 診断用
+ *
+ * 17.3 は `nowIso()` も一本化の対象に挙げていたが、決定 25 に合わせてここは残した。
+ */
 export function nowIso(): string {
   return new Date(Date.now()).toISOString();
 }

@@ -158,7 +158,7 @@ export const createOrderRoutes: FastifyPluginAsync = async (fastify) => {
     if (atLimit()) return err(ErrorCode.TOO_MANY_SIMULTANEOUS_ORDERS);
     await store.tick();
 
-    const now = new Date().toISOString();
+    const now = new Date(store.now()).toISOString();
     if (type === "market") {
       const fillPrice = await store.getLatestPrice(pair);
       if (fillPrice === null) return err(ErrorCode.INTERNAL);

@@ -79,7 +79,7 @@ export const cancelOrderRoutes: FastifyPluginAsync = async (fastify) => {
     const terminal = terminalCancelCode(target);
     if (terminal !== null) return err(terminal);
     if (!isActive(target)) return err(ErrorCode.ORDER_NOT_FOUND);
-    const r = cancelOrder(store.state(), wantId, new Date().toISOString());
+    const r = cancelOrder(store.state(), wantId, new Date(store.now()).toISOString());
     if (!r.success) return err(ErrorCode.ORDER_NOT_FOUND);
     await store.commit(r.data.state);
     return ok(formatOrder(r.data.order));
@@ -131,7 +131,7 @@ export const cancelOrderRoutes: FastifyPluginAsync = async (fastify) => {
     }
     if (toCancel.length === 0) return err(ErrorCode.ORDER_NOT_FOUND);
 
-    const now = new Date().toISOString();
+    const now = new Date(store.now()).toISOString();
     let next = working;
     const canceled = [];
     for (const id of toCancel) {

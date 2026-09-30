@@ -211,6 +211,10 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
     }
     const store = fastify.store;
     const lastMs = Date.parse(store.state().lastTickAt);
+    // ここは `store.now()` ではなく実時刻を読む。上限（下の `maxMs`）は「実時刻から 24 時間」と
+    // 決めてあり（`MAX_CLOCK_AHEAD_MS`）、記録する時刻の出どころ（`store.now()`）とは別の基準
+    // だから。`src/routes/` で `Date.now()` を直に呼んでよいのは、ここと `POST /clock` の
+    // 2 か所だけ（`tests/routes/time-source.test.ts`）。
     const realNowMs = Date.now();
     // 時計に許す上限。以降の 2 つの検査はどちらもこの値と比べる。
     const maxMs = realNowMs + MAX_CLOCK_AHEAD_MS;
@@ -283,6 +287,8 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
     // 「本文なし」と同じ扱いになり、黙って時計が動いてしまう。
     const body = request.body === undefined ? {} : asRecord(request.body);
     if (!body) return reply.code(400).send({ error: "INVALID_CLOCK" });
+    // ここは `store.now()` ではなく実時刻を読む。理由は `POST /tick` の `realNowMs` と同じで、
+    // 上限（`MAX_CLOCK_AHEAD_MS`）は「実時刻から 24 時間」と決めてあるため。
     const realNowMs = Date.now();
     let ms = realNowMs;
     if (body.lastTickAt !== undefined) {
@@ -343,7 +349,8 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
     }
 
     const before = store.state();
-    const r = fillOrder(before, orderId, price, amount, new Date().toISOString(), store.feeRate);
+    const at = new Date(store.now()).toISOString();
+    const r = fillOrder(before, orderId, price, amount, at, store.feeRate);
     if (!r.success) {
       if (r.error === "INVALID_AMOUNT") {
         return reply.code(400).send({ error: "INVALID_AMOUNT", remaining });
@@ -384,7 +391,7 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
     const order = before.orders.find((o) => o.id === orderId);
     if (!order) return reply.code(404).send({ error: "ORDER_NOT_FOUND" });
 
-    const r = rejectOrder(before, orderId, new Date().toISOString());
+    const r = rejectOrder(before, orderId, new Date(store.now()).toISOString());
     if (!r.success) {
       return reply.code(409).send({ error: "ORDER_NOT_ACTIVE", status: order.status });
     }

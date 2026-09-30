@@ -63,6 +63,9 @@ const TEST_WITHOUT_SRC: Record<string, string> = {
     "src の 1 モジュールに対応しない",
   "routes/pair-whitelist.test.ts": "ペアの実在性を検査する経路／しない経路を横断して見る",
   "routes/tick.test.ts": "互換ルートが必ず `SessionStore.tick()` を通ることを横断して見る",
+  "routes/time-source.test.ts":
+    "`src/routes/` の全ファイルが、記録する時刻を実時刻からではなく `SessionStore.now()` から" +
+    "読むことを横断して見る",
   "server/not-found.test.ts":
     "経路が見つからない要求の応答を、互換ルートと `/_control/` の両方で見る",
   "scenarios/plan-a.test.ts": "結合シナリオ。発注から約定までを複数モジュールにまたがって通す",
