@@ -136,6 +136,11 @@ export type SessionStoreOptions = {
   logger?: Logger;
   fillMode?: FillMode;
   persistFailureMode?: PersistFailureMode;
+  /**
+   * 時計（エポックミリ秒を返す関数）。`SessionStore.now()` の中身になる。既定は実時刻
+   * （呼ぶたびに `Date.now()` を読む）。
+   */
+  now?: () => number;
 };
 
 export class SessionStore {
@@ -146,6 +151,8 @@ export class SessionStore {
   readonly fillMode: FillMode;
   readonly persistFailureMode: PersistFailureMode;
   private readonly logger: Logger;
+  /** 時計。`now()` で読む。 */
+  private readonly clock: () => number;
   /** 直列化した書き込みの末尾。次の書き込みはこれが解決してから始める。 */
   private persistTail: Promise<void> = Promise.resolve();
   /** 予約済みでまだ始まっていない書き込み。重なった persist() はここへ合流する。 */
@@ -165,6 +172,9 @@ export class SessionStore {
     this.fillMode = opts.fillMode ?? fillMode();
     this.persistFailureMode = opts.persistFailureMode ?? persistFailureMode();
     this.logger = opts.logger ?? noopLogger;
+    // `Date.now` の参照をここで固定せず、呼ぶたびに読む。固定すると、store を作った後に
+    // `vi.useFakeTimers()` で `Date` を差し替えたテストで、この時計だけが実時刻のまま残る。
+    this.clock = opts.now ?? (() => Date.now());
     this._candlesHealth = {
       lastError: null,
       consecutiveFailures: 0,
@@ -175,6 +185,34 @@ export class SessionStore {
 
   state(): PaperState {
     return this._state;
+  }
+
+  /**
+   * いまの時刻（エポックミリ秒）。**状態に記録する時刻の出どころはここ 1 か所に寄せる**
+   * （`docs/plan-lab-mock.md` 17.3 の PR C1）。仮想時計（PR C2）はこの中身だけを差し替える。
+   *
+   * ここから読むもの:
+   *
+   * - 互換ルートの発注・取消の時刻（`ordered_at` / `canceled_at`。`src/routes/create-order.ts`・
+   *   `src/routes/cancel-order.ts`）
+   * - `/_control/` の fill の約定時刻と reject の時刻（`src/routes/control.ts`）
+   * - `tick()` と `getLatestPrice()` の `nowMs` の既定値
+   *
+   * **ここから読まないもの**（実時刻のまま）:
+   *
+   * - `POST /_control/tick` と `POST /_control/clock` の `realNowMs`。「実時刻から 24 時間」という
+   *   上限の基準なので、時計そのものからは測らない。**この値は上限のほかに、tick の前進の下限
+   *   （`max(realNowMs, lastTickAt + 60 秒)`）と、clock の本文を省いたときの行き先・`updatedAt` にも
+   *   使っている。** 仮想時計でこれらをどう扱うかは PR C2 で決める（17.2 の決定 25〜27）
+   * - `freshState()` の時刻（状態ファイルが無いときと `POST /_control/reset`）。reset で時計は
+   *   実時刻に戻る（`docs/plan-lab-mock.md` 17.2 の決定 25）
+   * - 書き出し失敗の記録時刻（`persistHealth()` の `lastError.at`）。診断用なので実時刻が正しい
+   *
+   * `src/routes/` が `Date.now()` / `new Date()` を直に呼ばないことは
+   * `tests/routes/time-source.test.ts` が見る。
+   */
+  now(): number {
+    return this.clock();
   }
 
   /**
@@ -347,7 +385,7 @@ export class SessionStore {
     return this.persistFailureMode === "degrade" && this._persistHealth.lastError !== null;
   }
 
-  async tick(nowMs: number = Date.now()): Promise<Map<string, Candle[]>> {
+  async tick(nowMs: number = this.now()): Promise<Map<string, Candle[]>> {
     const result = new Map<string, Candle[]>();
     if (this.fillMode === "manual") return result;
     // 劣化中は約定させない。読み取りは生かすが、tick は読み取りルートの先頭から呼ばれるので、
@@ -438,7 +476,7 @@ export class SessionStore {
    * どちらも封筒の `70001` に潰す。**どちらだったかは `candlesHealth()` で見分ける**
    * （取得の失敗ならそこに記録が残る）。`fillMode` が `manual` でもここは取りに行く。
    */
-  async getLatestPrice(pair: string, nowMs: number = Date.now()): Promise<number | null> {
+  async getLatestPrice(pair: string, nowMs: number = this.now()): Promise<number | null> {
     const r = await this.fetchCandlesTracked(pair, nowMs - LATEST_LOOKBACK_MS, nowMs);
     if (!r.success || r.data.length === 0) return null;
     return r.data.reduce((a, b) => (a.timestamp >= b.timestamp ? a : b)).close;
@@ -507,6 +545,9 @@ export class SessionStore {
     // クライアントは失敗と見て再送し、二重注文になる。書き込みが失敗しても 2xx を返すのが
     // ここの約束（docs/fidelity.md の「状態の永続化」）で、ログに出せなかったことで
     // その約束を破ってはならない。saveState 側も同じ扱い。
+    //
+    // 時刻は `this.now()` ではなく実時刻（`nowIso()`）で記録する。診断のための記録で、
+    // 「いつディスクに書けなかったか」は時計をどこへ動かしていても実時刻で読めるべきため。
     this._persistHealth = {
       lastError: { at: nowIso(), message: r.error },
       consecutiveFailures: this._persistHealth.consecutiveFailures + 1,

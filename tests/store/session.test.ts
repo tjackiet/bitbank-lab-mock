@@ -223,6 +223,76 @@ describe("SessionStore.tick", () => {
   });
 });
 
+describe("SessionStore.now", () => {
+  it("既定は実時刻", () => {
+    const store = new SessionStore(buildState(), { path: null, fillMode: "manual" });
+    const before = Date.now();
+    const now = store.now();
+    expect(now).toBeGreaterThanOrEqual(before);
+    expect(now).toBeLessThanOrEqual(Date.now());
+  });
+
+  // 既定の時計は `Date.now` の参照を作った時点で固定せず、呼ぶたびに読む。固定すると
+  // store を作った後に `Date` だけを偽物にしたテストで、この時計だけが実時刻のまま残る。
+  it("既定の時計は store を作った後に差し替えた Date にも従う", () => {
+    const store = new SessionStore(buildState(), { path: null, fillMode: "manual" });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(T0);
+      expect(store.now()).toBe(T0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("渡した時計を呼ぶたびに読む", () => {
+    let ms = T0;
+    const store = new SessionStore(buildState(), {
+      path: null,
+      fillMode: "manual",
+      now: () => ms,
+    });
+    expect(store.now()).toBe(T0);
+    ms = T0 + MIN;
+    expect(store.now()).toBe(T0 + MIN);
+  });
+
+  it("tick() の既定の時刻は store の時計", async () => {
+    const calls: Array<[number, number]> = [];
+    const fetchCandles: FetchCandles = async (_pair, fromMs, toMs) => {
+      calls.push([fromMs, toMs]);
+      return { success: true, data: [candle(T0 + MIN, 110, 110, 50, 105)] };
+    };
+    const store = new SessionStore(
+      buildState({
+        lastTickAt: new Date(T0).toISOString(),
+        orders: [buildOrder({ id: "1", side: "buy", price: 100, startAmount: 1 })],
+      }),
+      { path: null, fillMode: "market", fetchCandles, feeRate: 0, now: () => T0 + 2 * MIN },
+    );
+    await store.tick();
+    expect(calls).toEqual([[T0, T0 + 2 * MIN]]);
+    expect(store.state().trades).toHaveLength(1);
+    expect(store.state().lastTickAt).toBe(new Date(T0 + 2 * MIN).toISOString());
+  });
+
+  it("getLatestPrice() の既定の時刻は store の時計", async () => {
+    const calls: Array<[number, number]> = [];
+    const fetchCandles: FetchCandles = async (_pair, fromMs, toMs) => {
+      calls.push([fromMs, toMs]);
+      return { success: true, data: [candle(T0, 110, 110, 90, 105)] };
+    };
+    const store = new SessionStore(buildState(), {
+      path: null,
+      fillMode: "manual",
+      fetchCandles,
+      now: () => T0 + MIN,
+    });
+    expect(await store.getLatestPrice("btc_jpy")).toBe(105);
+    expect(calls).toEqual([[T0 + MIN - 5 * MIN, T0 + MIN]]);
+  });
+});
+
 describe("SessionStore.persist", () => {
   let dir: string;
 
@@ -417,6 +487,19 @@ describe("SessionStore.persist", () => {
     // 閉じた標準出力への console.warn は EPIPE で投げる。ここで投げ返すと、発注が
     // メモリ上では成立しているのにルートが封筒でない 500 を返し、クライアントの再送が
     // 二重注文になる。書き込みが失敗しても 2xx を返すのがここの約束。
+    // 失敗の時刻は診断用なので、store の時計（`now()`）ではなく実時刻で記録する。
+    // 時計を実時刻から大きく離しておき、どちらで記録したかを見分ける。
+    it("失敗の時刻は store の時計ではなく実時刻で記録する", async () => {
+      const path = join(dir, "health-clock", "state.json");
+      await mkdir(path, { recursive: true });
+      const store = new SessionStore(buildState(), { path, fillMode: "manual", now: () => T0 });
+      const before = Date.now();
+      await store.persist();
+      const at = Date.parse(store.persistHealth().lastError!.at);
+      expect(at).toBeGreaterThanOrEqual(before);
+      expect(at).toBeLessThanOrEqual(Date.now());
+    });
+
     it("logger が投げても persist は解決し、失敗は記録されている", async () => {
       const path = join(dir, "health-throw", "state.json");
       await mkdir(path, { recursive: true });

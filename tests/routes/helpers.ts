@@ -42,6 +42,11 @@ export type TestServerOptions = {
   fetchCandles?: FetchCandles;
   /** 既定は `camel`（`BITBANK_MOCK_STREAM_ASSET_KEYS` の既定）。環境変数には頼らない。 */
   streamAssetKeys?: AssetKeyStyle;
+  /**
+   * 既定は `SessionStore` の既定（実時刻）。**ルートが記録する時刻を store の時計から読んで
+   * いるかを見るテストだけが渡す**（`tests/routes/time-source.test.ts`）。
+   */
+  now?: () => number;
 };
 
 export async function buildTestServer(
@@ -55,6 +60,7 @@ export async function buildTestServer(
     fetchCandles: opts.fetchCandles ?? stubFetchCandles(candlesByPair),
     logger: opts.logger,
     feeRate: opts.feeRate,
+    now: opts.now,
   });
   const fastify = await buildServer({
     store,
