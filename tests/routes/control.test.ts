@@ -7,6 +7,7 @@ import { loadState } from "../../src/engine/persist.ts";
 import { activeOrders, type OrderRecord, type OrderStatus } from "../../src/engine/state.ts";
 import { controlRoutes, controlTokenHeader } from "../../src/routes/control.ts";
 import type { ClockMode } from "../../src/server/config.ts";
+import { FaultInjector } from "../../src/server/faults.ts";
 import { buildServer } from "../../src/server/http.ts";
 import { SessionStore } from "../../src/store/session.ts";
 import type { PrivateStreamMessage } from "../../src/stream/events.ts";
@@ -184,7 +185,11 @@ describe("/_control routes", () => {
     const store = new SessionStore(buildState(), { path: null, fillMode: "manual" });
     const fastify = Fastify({ logger: false, trustProxy: true });
     fastify.decorate("store", store);
-    await fastify.register(controlRoutes, { prefix: "/_control", token: "secret" });
+    await fastify.register(controlRoutes, {
+      prefix: "/_control",
+      token: "secret",
+      faults: new FaultInjector(store),
+    });
     cleanups.push(async () => {
       await fastify.close();
     });
@@ -1743,5 +1748,121 @@ describe("仮想時計の /_control/", () => {
     });
     expect(placed.json().data.ordered_at).toBe(store.now());
     expect(store.clockMode).toBe("virtual");
+  });
+});
+
+/**
+ * `/_control/faults`（REST の障害注入）の口の形。故障が当たったときの互換ルートの振る舞いは
+ * `tests/server/faults.test.ts` が見る。
+ */
+describe("/_control/faults", () => {
+  const cleanups: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    for (const fn of cleanups.splice(0)) await fn();
+  });
+
+  async function setup(opts?: Parameters<typeof buildControl>[1]) {
+    const r = await buildControl(undefined, opts);
+    cleanups.push(async () => {
+      await r.fastify.close();
+    });
+    const post = (payload: unknown) =>
+      r.fastify.inject({
+        method: "POST",
+        url: "/_control/faults",
+        payload: payload as Record<string, unknown>,
+      });
+    const list = async () =>
+      (await r.fastify.inject({ method: "GET", url: "/_control/faults" })).json();
+    return { ...r, post, list };
+  }
+
+  it("登録すると登録した 1 件を返し、一覧に登録した順で並ぶ", async () => {
+    const { post, list } = await setup();
+    const first = await post({
+      method: "POST",
+      path: "/v1/user/spot/order",
+      kind: "rate_limit",
+      count: 2,
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual({
+      fault: {
+        id: 1,
+        method: "POST",
+        path: "/v1/user/spot/order",
+        kind: "rate_limit",
+        status: 429,
+        count: 2,
+        remaining: 2,
+        hits: 0,
+      },
+    });
+    const second = await post({
+      method: "GET",
+      path: "/v1/user/assets",
+      kind: "server_error",
+      status: 503,
+    });
+    expect(second.json().fault).toMatchObject({ id: 2, status: 503, count: 1 });
+    expect((await list()).faults.map((f: { id: number }) => f.id)).toEqual([1, 2]);
+  });
+
+  it("形が違えば 400 INVALID_FAULT、当てられない（メソッド, パス）なら 400 INVALID_FAULT_TARGET", async () => {
+    const { fastify, post, list } = await setup();
+    const bad = await post({ method: "POST", path: "/v1/user/spot/order", kind: "timeout" });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json()).toEqual({ error: "INVALID_FAULT" });
+    const empty = await fastify.inject({ method: "POST", url: "/_control/faults" });
+    expect(empty.statusCode).toBe(400);
+    expect(empty.json()).toEqual({ error: "INVALID_FAULT" });
+
+    const target = await post({ method: "POST", path: "/_control/reset", kind: "rate_limit" });
+    expect(target.statusCode).toBe(400);
+    const body = target.json() as { error: string; targets: string[] };
+    expect(body.error).toBe("INVALID_FAULT_TARGET");
+    // 当てられるのは互換ルート（GET /v1/user/subscribe を含む）だけ。
+    expect(body.targets).toContain("POST /v1/user/spot/order");
+    expect(body.targets).toContain("GET /v1/user/subscribe");
+    expect(body.targets.every((k) => / \/v1\/user\//.test(k))).toBe(true);
+    expect((await list()).faults).toEqual([]);
+  });
+
+  it("DELETE /_control/faults/:id で 1 件、DELETE /_control/faults ですべて取り消す", async () => {
+    const { fastify, post, list } = await setup();
+    for (let i = 0; i < 3; i++) {
+      await post({ method: "GET", path: "/v1/user/assets", kind: "no_response" });
+    }
+    const one = await fastify.inject({ method: "DELETE", url: "/_control/faults/2" });
+    expect(one.statusCode).toBe(200);
+    expect(one.json().fault).toMatchObject({ id: 2, kind: "no_response", status: null });
+    expect((await list()).faults.map((f: { id: number }) => f.id)).toEqual([1, 3]);
+
+    for (const id of ["2", "0", "abc", "1.0", "99999999999999999999"]) {
+      const missing = await fastify.inject({ method: "DELETE", url: `/_control/faults/${id}` });
+      expect(missing.statusCode).toBe(404);
+      expect(missing.json()).toEqual({ error: "FAULT_NOT_FOUND" });
+    }
+
+    const all = await fastify.inject({ method: "DELETE", url: "/_control/faults" });
+    expect(all.json()).toEqual({ removed: 2 });
+    expect((await list()).faults).toEqual([]);
+  });
+
+  it.each([
+    ["POST", "/_control/faults"],
+    ["GET", "/_control/faults"],
+    ["DELETE", "/_control/faults"],
+    ["DELETE", "/_control/faults/1"],
+  ] as const)("非ループバックからの %s %s はトークンが無ければ 403", async (method, url) => {
+    const { fastify } = await setup();
+    const res = await fastify.inject({ method, url, remoteAddress: "10.0.0.8" });
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("control 無効時は 404", async () => {
+    const { fastify } = await setup({ controlEnabled: false });
+    const res = await fastify.inject({ method: "GET", url: "/_control/faults" });
+    expect(res.statusCode).toBe(404);
   });
 });

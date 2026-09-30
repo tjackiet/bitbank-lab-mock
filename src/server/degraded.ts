@@ -53,16 +53,19 @@ export const MUTATING_ROUTES: ReadonlySet<string> = new Set([
 /**
  * **状態ファイルに書かない control の口。** 劣化中も通す。
  *
- * private stream の保留・再送（`src/stream/hub.ts` の `PrivateStreamHub`）の 3 つで、
- * `PaperState` を読みも書きもせず、配信の層（hub のメモリ）だけを見る・変える。
- * `READ_ROUTES` に入れないのは、hold / release が読み取りではないからである（載せると
- * 「劣化中も通す読み取り経路」という名前と中身がずれる）。held だけは読み取りだが、
- * 同じ hub のメモリを見る兄弟の口なのでここにまとめる。
+ * どれも `PaperState` を読みも書きもせず、サーバのメモリだけを見る・変える。
+ * `READ_ROUTES` に入れないのは、読み取りではない口を含むからである（載せると
+ * 「劣化中も通す読み取り経路」という名前と中身がずれる）。読み取りの口（held と故障の一覧）も、
+ * 同じメモリを見る兄弟の口なのでここにまとめる。
  *
- * 劣化中に通すのは、**劣化の前に溜めたものを release で取り出せるようにするため**である
- * （劣化の引き金になった `70001` の要求のイベントも含む）。溜めたものはメモリにしか無く、
- * 復帰の手順（ディスクを直す → 読み出す → 再起動）で消えるので、断るとその回の stream の
- * 実験を回収できない。劣化中は状態が動かないので、新しく溜まるものは無い。
+ * - **private stream の保留・再送**（`src/stream/hub.ts` の `PrivateStreamHub`）の 3 つ。劣化中に
+ *   通すのは、**劣化の前に溜めたものを release で取り出せるようにするため**である（劣化の引き金に
+ *   なった `70001` の要求のイベントも含む）。溜めたものはメモリにしか無く、復帰の手順（ディスクを
+ *   直す → 読み出す → 再起動）で消えるので、断るとその回の stream の実験を回収できない。劣化中は
+ *   状態が動かないので、新しく溜まるものは無い
+ * - **REST の障害注入**（`src/server/faults.ts` の `FaultInjector`）の 4 つ。劣化中に通すのは、
+ *   劣化の前に登録した故障を見て取り消せるようにするため（`docs/plan-lab-mock.md` 18.2 の決定 34）。
+ *   断ると、読み取りの口に登録した故障が劣化中の照合に当たり続ける
  *
  * 載せてよいのは `/_control/` の経路だけ（`tests/server/degraded.test.ts` が見る）。
  */
@@ -70,6 +73,10 @@ export const NON_PERSISTING_CONTROL_ROUTES: ReadonlySet<string> = new Set([
   "POST /_control/stream/hold",
   "GET /_control/stream/held",
   "POST /_control/stream/release",
+  "POST /_control/faults",
+  "GET /_control/faults",
+  "DELETE /_control/faults",
+  "DELETE /_control/faults/:id",
 ]);
 
 /** 判定に使う鍵。`HEAD` は `GET` に寄せる（Fastify が GET から自動登録するため）。 */
