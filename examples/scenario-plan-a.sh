@@ -122,7 +122,16 @@ jpy_balance
 # **refuse を先に入れてから disconnect する。** 逆の順だと、その間に利用側が繋ぎ直せてしまう。
 # 切っている間の変化を後から stream で届けたいなら、refuse の前に /_control/stream/hold し、
 # 繋ぎ直してから /_control/stream/release する（接続が要るので、ここでは流さない）。
-# 途中で止まって受け付けない状態が残っても、次に流したときの冒頭の reset で戻る。
+#
+# 途中の検査で止まっても受け付けない状態を残さないよう、refuse の前に終了時の後始末を掛けて、
+# accept で戻す（同じモックへ繋ぐ他のクライアントが 503 を受け続けないため）。後始末の失敗は
+# 握りつぶし、スクリプトの終了コードは変えない。戻せなかったときも、次に流したときの冒頭の
+# reset で戻る。
+restore_stream() {
+  curl -sS -X POST "$BASE/_control/stream/accept" "${control_headers[@]}" -d '{}' \
+    >/dev/null 2>&1 || true
+}
+trap restore_stream EXIT
 
 echo "stream refuse（新しい接続を断る）:"
 refuse_json="$(curl -fsS -X POST "$BASE/_control/stream/refuse" "${control_headers[@]}" -d '{}')"
@@ -166,6 +175,8 @@ echo "stream accept（受け付ける状態に戻す）:"
 accept_json="$(curl -fsS -X POST "$BASE/_control/stream/accept" "${control_headers[@]}" -d '{}')"
 echo "$accept_json"
 require_match "$accept_json" '"accepting":true' "accept の応答"
+# 戻せたので、終了時の後始末は外す。
+trap - EXIT
 
 # 受け付ける状態に戻ったので、upgrade でない GET は 426 に戻る（WebSocket のクライアントなら繋がる）。
 echo "GET /_stream/private（426 を期待）:"
