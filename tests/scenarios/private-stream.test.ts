@@ -6,6 +6,7 @@ import { ErrorCode } from "../../src/routes/envelope.ts";
 import { buildServer } from "../../src/server/http.ts";
 import { SessionStore } from "../../src/store/session.ts";
 import type { PrivateStreamMessage } from "../../src/stream/events.ts";
+import { DISCONNECT_CLOSE_CODE } from "../../src/stream/hub.ts";
 import { buildOrder, buildState, candle } from "../engine/helpers.ts";
 import { connectStream, setupBuildTestServer, stubFetchCandles } from "../routes/helpers.ts";
 
@@ -15,7 +16,8 @@ import { connectStream, setupBuildTestServer, stubFetchCandles } from "../routes
  * 受入条件は `docs/plan-lab-mock.md` 3.4 の「注文を 2 本発注し、1 本を `/_control/` で約定、
  * もう 1 本を取消する」流れ。加えて、状態が変わる経路のうち**遷移関数の戻り値だけを見る
  * 発火では取りこぼすもの**（一括取消・market の tick）と、書き出しに失敗したときの流れ方
- * （`docs/plan-lab-mock.md` 16 節の決定 14）を見る。
+ * （`docs/plan-lab-mock.md` 16 節の決定 14）を見る。最後に、stream が切れる筋を利用側の
+ * 規則（fail-closed・照合・再同期・単調性・終端の優先）の順に通す（同 18.2 の決定 35）。
  */
 
 const buy = (price: number, amount = 0.001) => ({
@@ -244,5 +246,161 @@ describe("private stream と書き出しの失敗", () => {
     } finally {
       await fastify.close();
     }
+  });
+});
+
+/**
+ * stream が**切れる**筋を、利用側の規則の順に通す（`docs/fidelity.md` の「private stream の切断」節）。
+ *
+ * - **fail-closed**: 切れて繋がらない間も、REST の照合（`orders_info`）と発注は通る
+ * - **再同期**: 繋ぎ直した後は、未決の注文を照合してから受付を再開する。切れていた間の変化は、
+ *   保留していなければ stream では届かないので、照合でしか拾えない
+ * - **単調性・終端の優先**: 切る前に保留して繋ぎ直した後に release すると、照合で知った状態より
+ *   古いスナップショットが遅れて届く。利用側はそれを捨てる
+ *
+ * ここで見るのはモックが**何を届けるか**で、利用側の規則そのものは実装しない。
+ */
+describe("private stream の切断のシナリオ", () => {
+  const build = setupBuildTestServer();
+
+  async function setup() {
+    const { fastify } = await build(buildState(), {}, { fillMode: "manual", controlEnabled: true });
+    const post = (url: string, payload?: Record<string, unknown>) =>
+      fastify.inject({ method: "POST", url, ...(payload === undefined ? {} : { payload }) });
+    /** REST の照合。利用側が stream の代わりに状態を確かめる口。 */
+    const reconcile = async (ids: number[]) =>
+      (await post("/v1/user/spot/orders_info", { pair: "btc_jpy", order_ids: ids })).json().data
+        .orders as Array<Record<string, unknown>>;
+    return { fastify, post, reconcile };
+  }
+
+  /** 注文の `status` と `executed_amount`。どのスナップショットかを読むのに使う。 */
+  const snapshot = (o: Record<string, unknown> | undefined) => ({
+    order_id: o?.order_id,
+    status: o?.status,
+    executed_amount: o?.executed_amount,
+  });
+  const orderSnapshots = (ms: PrivateStreamMessage[]) =>
+    ms.filter((m) => m.message.method === "spot_order").map((m) => snapshot(param(m)));
+
+  it("refuse → disconnect の間の約定と取消は、繋ぎ直した stream には現れず、照合で拾う（fail-closed → 照合 → 再同期）", async () => {
+    const { fastify, post, reconcile } = await setup();
+    const first = await connectStream(fastify);
+    const idA = (await post("/v1/user/spot/order", buy(5_000_000, 0.002))).json().data.order_id;
+    const idB = (await post("/v1/user/spot/order", buy(4_000_000))).json().data.order_id;
+    await first.flush();
+    expect(methods(first.take())).toEqual([
+      "spot_order_new",
+      "asset_update",
+      "spot_order_new",
+      "asset_update",
+    ]);
+
+    // 受け付けない状態を先に入れてから切る。この順なら、その間に繋ぎ直されない。
+    expect((await post("/_control/stream/refuse")).json()).toEqual({ accepting: false });
+    expect((await post("/_control/stream/disconnect")).json()).toEqual({ closed: 1 });
+    expect((await first.closed).code).toBe(DISCONNECT_CLOSE_CODE);
+
+    // 切れている間に、A が部分約定し、B を取り消す（取消は互換ルートからも通る）。
+    expect((await post(`/_control/orders/${idA}/fill`, { amount: 0.001 })).statusCode).toBe(200);
+    const cancel = await post("/v1/user/spot/cancel_order", { pair: "btc_jpy", order_id: idB });
+    expect(cancel.json().success).toBe(1);
+
+    // fail-closed の間: 繋ぎ直しは断られるが、REST の照合は通り、切れていた間の変化が見える。
+    await expect(connectStream(fastify)).rejects.toThrow("Unexpected server response: 503");
+    expect((await reconcile([idA, idB])).map(snapshot)).toEqual([
+      { order_id: idA, status: "PARTIALLY_FILLED", executed_amount: "0.0010" },
+      { order_id: idB, status: "CANCELED_UNFILLED", executed_amount: "0.0000" },
+    ]);
+
+    // 再同期: 繋ぎ直しても、切れていた間の変化は stream では届かない（保留していないので）。
+    expect((await post("/_control/stream/accept")).json()).toEqual({ accepting: true });
+    const again = await connectStream(fastify);
+    await again.flush();
+    expect(again.messages).toEqual([]);
+
+    // 繋ぎ直した後の変化は届き、照合で知った状態から先へ進んだスナップショットになる。
+    await post(`/_control/orders/${idA}/fill`);
+    await again.flush();
+    expect(methods(again.messages)).toEqual([
+      "spot_order",
+      "spot_trade",
+      "asset_update",
+      "asset_update",
+    ]);
+    expect(orderSnapshots(again.messages)).toEqual([
+      { order_id: idA, status: "FULLY_FILLED", executed_amount: "0.0020" },
+    ]);
+    const { executed_at, is_just_triggered, ...streamed } = param(again.messages[0]);
+    expect(streamed).toEqual((await reconcile([idA]))[0]);
+    again.ws.terminate();
+  });
+
+  it("切る前に hold し、照合の後に release すると、照合より古いスナップショットが遅れて届く（単調性・終端の優先）", async () => {
+    const { fastify, post, reconcile } = await setup();
+    const first = await connectStream(fastify);
+    const idA = (await post("/v1/user/spot/order", buy(5_000_000, 0.002))).json().data.order_id;
+    await first.flush();
+    first.take();
+
+    await post("/_control/stream/hold");
+    await post("/_control/stream/refuse");
+    await post("/_control/stream/disconnect");
+    expect((await first.closed).code).toBe(DISCONNECT_CLOSE_CODE);
+
+    // 切れている間に半分ずつ 2 回約定する。接続は 0 本だが、保留中なので溜まる。
+    await post(`/_control/orders/${idA}/fill`, { amount: 0.001 });
+    await post(`/_control/orders/${idA}/fill`);
+    const held = (await fastify.inject({ method: "GET", url: "/_control/stream/held" })).json();
+    expect(held).toMatchObject({ holding: true, held: 8, accepting: false });
+
+    // 照合では、もう終端（FULLY_FILLED）まで進んでいる。
+    const reconciled = (await reconcile([idA]))[0];
+    expect(snapshot(reconciled)).toEqual({
+      order_id: idA,
+      status: "FULLY_FILLED",
+      executed_amount: "0.0020",
+    });
+
+    await post("/_control/stream/accept");
+    const again = await connectStream(fastify);
+    const res = await post("/_control/stream/release");
+    expect(res.json()).toEqual({ sent: 8, omitted: [], clients: 1 });
+    await again.flush();
+
+    // 照合の後に、照合より古い PARTIALLY_FILLED（約定量も少ない）が届く。利用側は単調性と
+    // 終端の優先でこれを捨て、続く FULLY_FILLED だけを採る。
+    expect(orderSnapshots(again.messages)).toEqual([
+      { order_id: idA, status: "PARTIALLY_FILLED", executed_amount: "0.0010" },
+      { order_id: idA, status: "FULLY_FILLED", executed_amount: "0.0020" },
+    ]);
+    // 最後に届いたスナップショットは、照合の結果と一致する。
+    const last = again.messages.filter((m) => m.message.method === "spot_order").at(-1);
+    const { executed_at, is_just_triggered, ...streamed } = param(last);
+    expect(streamed).toEqual(reconciled);
+    expect(first.messages).toEqual([]);
+    again.ws.terminate();
+  });
+
+  it("disconnect → refuse の逆の順だと、その間に繋ぎ直した接続が残り、stream は切れていない", async () => {
+    const { fastify, post } = await setup();
+    const first = await connectStream(fastify);
+    expect((await post("/_control/stream/disconnect")).json()).toEqual({ closed: 1 });
+    expect((await first.closed).code).toBe(DISCONNECT_CLOSE_CODE);
+
+    // refuse を入れる前に、利用側がすぐ繋ぎ直す。
+    const fast = await connectStream(fastify);
+    expect((await post("/_control/stream/refuse")).json()).toEqual({ accepting: false });
+
+    // refuse は今の接続を閉じないので、この接続には変化が届き続ける。
+    await post("/v1/user/spot/order", buy(5_000_000));
+    await fast.flush();
+    expect(methods(fast.take())).toEqual(["spot_order_new", "asset_update"]);
+    await expect(connectStream(fastify)).rejects.toThrow("Unexpected server response: 503");
+
+    // 切るには disconnect をもう 1 度呼ぶ。
+    expect((await post("/_control/stream/disconnect")).json()).toEqual({ closed: 1 });
+    expect((await fast.closed).code).toBe(DISCONNECT_CLOSE_CODE);
+    expect(fastify.privateStream.clientCount()).toBe(0);
   });
 });
