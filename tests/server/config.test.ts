@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  apiCredentials,
+  apiCredentialsConflict,
   clockMode,
   fillMode,
   isControlEnabled,
@@ -88,5 +90,33 @@ describe("server config", () => {
     expect(virtualClockConflicts({})).toEqual([]);
     expect(virtualClockConflicts({ BITBANK_MOCK_FILL_MODE: "market" })).toEqual([]);
     expect(virtualClockConflicts({ BITBANK_MOCK_CLOCK: "VIRTUAL" })).toEqual([]);
+  });
+
+  /**
+   * 認証のキーとシークレット（`docs/plan-lab-mock.md` 19.2 の決定 37）。両方そろったときだけ検証し、
+   * どちらも無ければ検証しない（既定）。片方だけなら起動を断る理由を返す。空文字は未設定。
+   */
+  it("認証のキーとシークレットは両方そろったときだけ返す", () => {
+    const both = { BITBANK_MOCK_API_KEY: "k", BITBANK_MOCK_API_SECRET: "s" };
+    expect(apiCredentials(both)).toEqual({ key: "k", secret: "s" });
+    expect(apiCredentials({})).toBeNull();
+    expect(apiCredentials({ BITBANK_MOCK_API_KEY: "k" })).toBeNull();
+    expect(apiCredentials({ ...both, BITBANK_MOCK_API_SECRET: "" })).toBeNull();
+  });
+
+  it("キーとシークレットの片方だけなら、起動を断る理由を返す", () => {
+    expect(apiCredentialsConflict({})).toBeNull();
+    expect(
+      apiCredentialsConflict({ BITBANK_MOCK_API_KEY: "", BITBANK_MOCK_API_SECRET: "" }),
+    ).toBeNull();
+    expect(
+      apiCredentialsConflict({ BITBANK_MOCK_API_KEY: "k", BITBANK_MOCK_API_SECRET: "s" }),
+    ).toBeNull();
+    expect(apiCredentialsConflict({ BITBANK_MOCK_API_KEY: "k" })).toContain(
+      "BITBANK_MOCK_API_KEY だけ",
+    );
+    expect(
+      apiCredentialsConflict({ BITBANK_MOCK_API_KEY: "", BITBANK_MOCK_API_SECRET: "s" }),
+    ).toContain("BITBANK_MOCK_API_SECRET だけ");
   });
 });

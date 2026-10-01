@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { acquireStateLock, StateLockedError, stateLockPath } from "../src/store/lock.ts";
+import { timeWindowHeaders } from "./server/auth-sign.ts";
 import {
   collectStderr,
+  collectStdout,
   freePort,
   requestJson,
   spawnServer,
@@ -244,4 +246,129 @@ describe("src/index.ts: 仮想時計", () => {
     expect(Date.parse(reset.lastTickAt)).toBeGreaterThanOrEqual(before);
     expect(Date.parse(reset.lastTickAt)).toBeLessThanOrEqual(Date.now());
   }, 60_000);
+});
+
+/**
+ * 認証ヘッダの検証（`BITBANK_MOCK_API_KEY` / `BITBANK_MOCK_API_SECRET`）の配線
+ * （`docs/plan-lab-mock.md` 19.2 の決定 37・43）。
+ *
+ * - **片方だけ設定したら起動を断る**。断る判定は状態ファイルに触れる前（ロックも取らない）で、
+ *   仮想時計の条件違反と同じ扱い
+ * - 両方そろえば検証が効き、起動の行に `auth=on` が出る。断った要求のログには理由とメソッドとパス
+ *   だけが出て、**シークレット・署名・署名対象の文字列は出ない**
+ *
+ * 判定そのものは `tests/server/auth.test.ts` が見る。ここは `src/index.ts` が env を読んで渡しているかと、
+ * 実際のログに何が出るかだけを見る。
+ */
+describe("src/index.ts: 認証ヘッダの検証", () => {
+  let dir: string | null = null;
+  let child: ChildProcess | null = null;
+
+  afterEach(async () => {
+    if (child && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await waitForExit(child);
+    }
+    child = null;
+    if (dir) await rm(dir, { recursive: true, force: true });
+    dir = null;
+  });
+
+  it.each([
+    ["キーだけ", { BITBANK_MOCK_API_KEY: "one-sided-key", BITBANK_MOCK_API_SECRET: undefined }],
+    [
+      "シークレットだけ",
+      { BITBANK_MOCK_API_KEY: undefined, BITBANK_MOCK_API_SECRET: "one-sided-secret" },
+    ],
+    [
+      "キーと空文字のシークレット",
+      { BITBANK_MOCK_API_KEY: "one-sided-key", BITBANK_MOCK_API_SECRET: "" },
+    ],
+  ])(
+    "%s を設定すると、状態ファイルに触れる前に終了コード 1 で断る",
+    async (_label, env) => {
+      dir = await mkdtemp(join(tmpdir(), "bitbank-mock-auth-"));
+      const statePath = join(dir, "state.json");
+
+      child = spawnServer({
+        ...env,
+        BITBANK_MOCK_STATE_PATH: statePath,
+        BITBANK_MOCK_PORT: String(await freePort()),
+      });
+      const stderr = collectStderr(child);
+      const outcome = await Promise.race([
+        waitForExit(child).then(() => "exited" as const),
+        waitUntilListening(child).then(
+          () => "listening" as const,
+          () => "exited" as const,
+        ),
+      ]);
+
+      expect(outcome).toBe("exited");
+      expect(child.exitCode).toBe(1);
+      expect(stderr()).toContain("BITBANK_MOCK_API_KEY と BITBANK_MOCK_API_SECRET は");
+      // 値そのものは出さない。
+      expect(stderr()).not.toContain("one-sided-key");
+      expect(stderr()).not.toContain("one-sided-secret");
+      expect(existsSync(stateLockPath(statePath))).toBe(false);
+      expect(existsSync(statePath)).toBe(false);
+    },
+    40_000,
+  );
+
+  it("両方を設定すると検証が効き、断った要求のログに秘密を出さない", async () => {
+    dir = await mkdtemp(join(tmpdir(), "bitbank-mock-auth-"));
+    const port = await freePort();
+    const key = "index-test-key";
+    const secret = "index-test-secret-value";
+    child = spawnServer({
+      BITBANK_MOCK_API_KEY: key,
+      BITBANK_MOCK_API_SECRET: secret,
+      BITBANK_MOCK_CONTROL: "1",
+      BITBANK_MOCK_STATE_PATH: join(dir, "state.json"),
+      BITBANK_MOCK_PORT: String(port),
+    });
+    const stdout = collectStdout(child);
+    const listening = await waitUntilListening(child);
+    expect(listening).toBeDefined();
+
+    const order = { pair: "btc_jpy", side: "buy", type: "limit", price: 5_000_000, amount: 0.001 };
+    const body = JSON.stringify(order);
+    const sign = (s: string) =>
+      timeWindowHeaders({ key, secret: s, requestTime: String(Date.now()), target: { body } });
+
+    // 正しい署名は通る。
+    const ok = await requestJson(port, "POST", "/v1/user/spot/order", order, sign(secret));
+    expect(ok.body).toMatchObject({ success: 1, data: { order_id: 1 } });
+
+    // 別のシークレットで署名した要求は断られ、ログには理由とメソッドとパスだけが出る。
+    const bad = sign("wrong-secret");
+    const rejected = await requestJson(port, "POST", "/v1/user/spot/order", order, bad);
+    expect(rejected).toEqual({ status: 200, body: { success: 0, data: { code: 20005 } } });
+
+    // ログは子プロセスの標準出力を経て届くので、行が現れるまで待つ（応答より遅れて届き得る）。
+    const deadline = Date.now() + 10_000;
+    while (!stdout().includes("auth rejected") && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const log = stdout();
+    expect(log).toContain("auth=on");
+    const line = log.split("\n").find((l) => l.includes("auth rejected"));
+    expect(line).toBeDefined();
+    expect(JSON.parse(line!)).toMatchObject({
+      msg: "auth rejected: signature mismatch",
+      method: "POST",
+      path: "/v1/user/spot/order",
+    });
+    // シークレット・署名・署名対象の文字列（本文を含む）は、どの行にも出ない。
+    for (const leaked of [
+      secret,
+      bad["ACCESS-SIGNATURE"]!,
+      sign(secret)["ACCESS-SIGNATURE"]!,
+      body,
+      bad["ACCESS-REQUEST-TIME"]! + bad["ACCESS-TIME-WINDOW"]!,
+    ]) {
+      expect(log).not.toContain(leaked);
+    }
+  }, 40_000);
 });

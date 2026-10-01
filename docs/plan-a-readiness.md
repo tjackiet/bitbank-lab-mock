@@ -49,7 +49,10 @@
 - **private stream** — 実装しているが、配信は PubNub でなく素の WebSocket で、**いつ届くかもモック固有**である。
   メッセージの中身は公式の形に寄せてあるが、公式が食い違っている箇所（`asset_update` のキー）と書いていない箇所
   （`executed_at`）は推測で決めた。[`fidelity.md` の「private stream」](fidelity.md#private-stream)から始まる一連の節
-- **非目標に挙げたもの**（認証・レート制限・注文訂正・障害注入など） — [`README.md`](../README.md) の
+- **認証ヘッダの検証** — 既定では検証しない。`BITBANK_MOCK_API_KEY` と `BITBANK_MOCK_API_SECRET` で有効にでき、
+  署名の組み立て方と時刻の窓は公式の記述どおりだが、**断るときの番号・順・HTTP ステータスは実測していない**。
+  [`fidelity.md` の「認証」](fidelity.md#認証)
+- **非目標に挙げたもの**（API キーの権限などの認証の一部・レート制限・注文訂正・障害注入など） — [`README.md`](../README.md) の
   「非目標（Plan A）」と 5 節
 
 **これはこのモックについての自己申告である。** 何をどこまで検証したかは上の各節が持つので、
@@ -74,6 +77,7 @@
 | push の順序の入れ替わり・重複・欠落を起こす手段 | 対応 | `POST /_control/stream/hold` / `GET /_control/stream/held` / `POST /_control/stream/release` | [private stream の順序](fidelity.md#private-stream-の順序) / [private stream の保留・再送](fidelity.md#private-stream-の保留再送) |
 | 注文を `REJECTED` にする手段 | 対応 | `POST /_control/orders/:order_id/reject` | [注文状態](fidelity.md#注文状態) / [`/_control/`](fidelity.md#_control) / [private stream の注文ペイロード](fidelity.md#private-stream-の注文ペイロード) |
 | REST の 429・5xx・応答不明を起こす手段 | **一部** | `POST /_control/faults` / `GET /_control/faults` / `DELETE /_control/faults/:id` / `DELETE /_control/faults` | [REST の障害注入](fidelity.md#rest-の障害注入) / [レート制限](fidelity.md#レート制限) |
+| 署名（認証ヘッダ）の検証 | **一部** | `BITBANK_MOCK_API_KEY` と `BITBANK_MOCK_API_SECRET` を両方設定して起動 | [認証](fidelity.md#認証) |
 
 「**一部**」と書いたものは、対応してはいるが**範囲に条件が付く**もの。条件そのものは上の節で読む。
 
@@ -98,6 +102,10 @@
   指定したとおりにしか起きない（回数を数えるレート制限は無く、ポーリングが枠に収まっているかは確かめられない）。
   **5xx の本文と、実 API がいつ 5xx を返すかは推測**である。条件は
   [`fidelity.md` の「REST の障害注入」](fidelity.md#rest-の障害注入)にある
+- **署名の検証** — **既定では検証しない**。有効にすると互換ルートだけを見て、`/_control/` と private stream は見ない。
+  公式の 2 方式を受け、パスとクエリ・本文を生のまま比べるので、中継による書き換えを踏める。時刻の窓は実時刻で見る。
+  **断るときの番号と HTTP 200 は推測**で、鍵は 1 組だけ（キーの権限・IP 制限は無い）。条件は
+  [`fidelity.md` の「認証」](fidelity.md#認証)にある
 
 ### 実装しているエンドポイント
 
@@ -153,6 +161,9 @@
   公式ドキュメントと実 API が食い違っており、公式に寄せてある。**同じ要求でモックと実 API の結果が変わる**
 - [同じ名前で複数来る値](fidelity.md#同じ名前で複数来る値) — **数値を取るパラメータについては実 API の挙動を測っていない**
   （id を同名 2 本送ったときだけ実 API で確かめてある）。同名パラメータを複数送る経路が無いか確認してほしい
+- [認証](fidelity.md#認証) — **認証ヘッダの検証を有効にしたときだけ**効く。断るときの番号（`2000x` / `2003x` のどれを返すか）と
+  HTTP 200 は、どちらも `errors.md` の意味と未登録パスでの 2 つの観測からの推測である。
+  **認証の失敗を番号ごとに分岐せず系統で扱い、HTTP ステータスで見分けないこと**
 
 ### 応答の形とパーサ（基準 a）
 
@@ -211,7 +222,7 @@
 - 動作保証・互換性・継続提供をしないことと、本物の API キーを向けないことは
   [`README.md`](../README.md) の「免責事項」にある
 - 個別の未実装項目の理由は、対応表の
-  [認証](fidelity.md#認証) / [レート制限](fidelity.md#レート制限) / [注文訂正](fidelity.md#注文訂正) /
+  [認証](fidelity.md#認証)（キーの権限・IP 制限など、検証を有効にしても見ないもの） / [レート制限](fidelity.md#レート制限) / [注文訂正](fidelity.md#注文訂正) /
   [成行注文の価格上限](fidelity.md#成行注文の価格上限) / [private stream の順序](fidelity.md#private-stream-の順序)（時間で遅らせる注入・乱数での注入） /
   [private stream の `spot_order_invalidation`](fidelity.md#private-stream-の-spot_order_invalidation) の各節にある
 

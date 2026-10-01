@@ -48,8 +48,39 @@ export const ErrorCode = {
    * ステータスに触らない）。
    */
   TOO_MANY_REQUESTS: 10009,
+  // 認証の系統（errors.md の AUTHENTICATION_ERROR）。返すのは**認証ヘッダの検証を有効にしたとき**
+  // だけで（`BITBANK_MOCK_API_KEY` と `BITBANK_MOCK_API_SECRET`）、判定は `src/server/auth.ts`。
+  // どの失敗にどれを充てたかは**実 API で実測していない推測**である（`docs/fidelity.md` の「認証」節）。
+  /**
+   * "Authentication failed api authorization."（日本語版「API認証に失敗しました」）。認証の系統の
+   * 受け皿で、専用の番号が無い失敗（`ACCESS-NONCE` が整数でない・増えていない、
+   * `ACCESS-TIME-WINDOW` が整数でないか上限超え）に返す。
+   */
   INVALID_AUTH: 20001,
+  /** "Invalid ACCESS-KEY."（「ACCESS-KEYの値が不正です」）。設定したキーと一致しないときに返す。 */
+  INVALID_ACCESS_KEY: 20002,
+  /**
+   * 公式の意味は "ACCESS-KEY not found."（「ACCESS-KEYが存在しません」）。**この意味どおり**に
+   * 使うのは、未登録の `/v1/user/...` パス（`src/server/http.ts`）と、`ACCESS-KEY` ヘッダの無い要求
+   * （`src/server/auth.ts`）の 2 か所。**それ以外はパラメータの不正値の受け皿への流用**である
+   * （`docs/fidelity.md` の「エラーコード」節）。名前が流用の側なのは、使う箇所が多いほうに合わせたため。
+   */
   INVALID_PARAMETER: 20003,
+  /** "ACCESS-NONCE not found."（「ACCESS-NONCEが存在しません」）。ACCESS-NONCE 方式でヘッダが無いとき。 */
+  ACCESS_NONCE_NOT_FOUND: 20004,
+  /**
+   * **英日で意味が食い違う。** 英語版は "Invalid ACCESS-SIGNATURE."、日本語版は
+   * 「ACCESS-SIGNATUREが存在しません」。どちらの意味でも当たるよう、ヘッダが無いときと
+   * 署名が合わないときの両方に返す（`docs/fidelity.md` の「認証」節）。
+   */
+  INVALID_ACCESS_SIGNATURE: 20005,
+  /** "ACCESS-REQUEST-TIME not found."（「ACCESS-REQUEST-TIMEが存在しません」）。 */
+  ACCESS_REQUEST_TIME_NOT_FOUND: 20033,
+  /**
+   * "Invalid time of ACCESS-REQUEST-TIME."（「ACCESS-REQUEST-TIMEの時刻が不正です」）。
+   * 整数でないときと、時刻の窓の外のときに返す。
+   */
+  INVALID_ACCESS_REQUEST_TIME: 20034,
   MISSING_AMOUNT: 30001,
   MISSING_ORDER_ID: 30006,
   MISSING_ORDER_IDS: 30007,

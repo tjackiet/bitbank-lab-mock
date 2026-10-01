@@ -218,11 +218,16 @@ export class FaultInjector {
 
 /**
  * 故障を当てるフックを足す。**互換ルートを登録する前に呼ぶ**（`onRoute` で対象を集めるため）。
+ * 認証の検証を有効にしたときは、**認証のフック（`src/server/auth.ts` の `registerAuth()`）より後に呼ぶ**。
  *
- * - `onRequest`: 故障を取り出す。**劣化の判定（`preHandler`）より前**なので、劣化中でも故障が先に
+ * - `preParsing`: 故障を取り出す。**劣化の判定（`preHandler`）より前**なので、劣化中でも故障が先に
  *   当たり、回数も減る（決定 34）。429 と 5xx は**ハンドラへ入る前に**ここで返す——ハンドラの中の
  *   `store.tick()` が market モードで約定を起こさないように（決定 30）。本文の解析より前でもあるので、
- *   壊れた本文の要求にも当たる（要求の中身に依らず当たる。決定 29）
+ *   壊れた本文の要求にも当たる（要求の中身に依らず当たる。決定 29）。**認証の判定より後**で、
+ *   認証に通らない要求には当たらず、回数も減らない（`docs/plan-lab-mock.md` 19.2 の決定 42）。
+ *   `onRequest` でなく `preParsing` に置くのはこのためで、認証は POST の本文を読んでから判定するので
+ *   `onRequest` では済まない。同じ `preParsing` の中では足した順に走り、先のフックが応答を送り終えた
+ *   要求では後のフックが走らない
  * - `onSend`: 応答不明と「状態を変えたうえで 5xx」。ハンドラ（と状態ファイルへの書き出し）を
  *   最後まで通した後、送る直前に接続を切るか、応答を 5xx に差し替える。劣化中にハンドラへ入れず
  *   `70001` を返した要求も同じく切るか差し替える（状態はもともと変わらない）
@@ -230,7 +235,7 @@ export class FaultInjector {
  * 保留中の private stream との間に特例は無い（決定 36）。状態の差し替えが溜まるだけである。
  */
 export function registerFaultInjection(fastify: FastifyInstance, injector: FaultInjector): void {
-  /** ハンドラの後で応答を切るか差し替える故障。`onRequest` で置き、`onSend` で取り出す。 */
+  /** ハンドラの後で応答を切るか差し替える故障。`preParsing` で置き、`onSend` で取り出す。 */
   const pending = new WeakMap<
     FastifyRequest,
     Extract<FiredFault, { kind: "no_response" | "server_error_after_apply" }>
@@ -241,7 +246,7 @@ export function registerFaultInjection(fastify: FastifyInstance, injector: Fault
     for (const method of methods) injector.addRoute(method, route.url);
   });
 
-  fastify.addHook("onRequest", async (request, reply) => {
+  fastify.addHook("preParsing", async (request, reply) => {
     const url = request.routeOptions.url;
     if (url === undefined) return;
     const fault = injector.take(request.method, url);

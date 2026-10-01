@@ -69,6 +69,39 @@ export function virtualClockConflicts(env: NodeJS.ProcessEnv = process.env): str
   return conflicts;
 }
 
+/** 認証ヘッダの検証に使う API キーとシークレット。 */
+export type ApiCredentials = { key: string; secret: string };
+
+/**
+ * 認証ヘッダを検証するときの API キーとシークレット（`BITBANK_MOCK_API_KEY` /
+ * `BITBANK_MOCK_API_SECRET`）。**両方が設定されたときだけ**返し、それ以外は `null`（検証しない。
+ * 既定の挙動）。空文字は未設定として扱う（他の env 読み取りと同じ規則）。
+ *
+ * 片方だけのときも `null` を返すが、`src/index.ts` は `apiCredentialsConflict()` で起動を断る
+ * （`docs/plan-lab-mock.md` 19.2 の決定 37）。ここは値を読むだけで、組み合わせは見ない。
+ */
+export function apiCredentials(env: NodeJS.ProcessEnv = process.env): ApiCredentials | null {
+  const key = env.BITBANK_MOCK_API_KEY;
+  const secret = env.BITBANK_MOCK_API_SECRET;
+  return key && secret ? { key, secret } : null;
+}
+
+/**
+ * キーとシークレットの片方だけが設定されているとき、起動を断る理由。両方あるか、どちらも無ければ `null`。
+ * `src/index.ts` が状態ファイルに触れる前に呼ぶ（仮想時計の `virtualClockConflicts()` と同じ扱い）。
+ *
+ * **warn を出して検証を切る、にはしない。** 見落とすと、署名を確かめているつもりの実験が
+ * 黙って検証なしで走り、署名のずれが本番まで見つからないため（決定 37）。
+ */
+export function apiCredentialsConflict(env: NodeJS.ProcessEnv = process.env): string | null {
+  const key = Boolean(env.BITBANK_MOCK_API_KEY);
+  const secret = Boolean(env.BITBANK_MOCK_API_SECRET);
+  if (key === secret) return null;
+  return key
+    ? "BITBANK_MOCK_API_KEY だけが設定されている（BITBANK_MOCK_API_SECRET が未設定か空文字）"
+    : "BITBANK_MOCK_API_SECRET だけが設定されている（BITBANK_MOCK_API_KEY が未設定か空文字）";
+}
+
 export function listenHost(env: NodeJS.ProcessEnv = process.env): string {
   if (env.BITBANK_MOCK_HOST) return env.BITBANK_MOCK_HOST;
   return isControlEnabled(env) ? "127.0.0.1" : "0.0.0.0";
