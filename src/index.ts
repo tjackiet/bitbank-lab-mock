@@ -1,6 +1,8 @@
 import { defaultStatePath, sweepOrphanTempFiles } from "./engine/persist.ts";
 import { PRIVATE_STREAM_PATH } from "./routes/private-stream.ts";
 import {
+  apiCredentials,
+  apiCredentialsConflict,
   clockMode,
   fillMode,
   isControlEnabled,
@@ -54,6 +56,19 @@ async function main() {
     process.exit(1);
   }
 
+  // 認証のキーとシークレットが片方だけなら、同じく状態ファイルに触れる前に断る
+  // （`docs/plan-lab-mock.md` 19.2 の決定 37）。warn で済ませて検証を切ると、署名を確かめている
+  // つもりの実験が黙って検証なしで走る。値そのものは出さない。
+  const credentialsConflict = apiCredentialsConflict();
+  if (credentialsConflict !== null) {
+    console.error(
+      "BITBANK_MOCK_API_KEY と BITBANK_MOCK_API_SECRET は両方を設定するか、どちらも設定しないでください: " +
+        credentialsConflict,
+    );
+    process.exit(1);
+  }
+  const credentials = apiCredentials();
+
   // 状態ファイルを読む前に排他を取る。取れなければ起動しない。
   // 2 プロセスが同じ状態ファイルを使うと、両方が成功を返しながら片方の注文が丸ごと消える。
   const statePath = defaultStatePath("default");
@@ -79,6 +94,7 @@ async function main() {
     logger: true,
     controlEnabled: control,
     controlToken: process.env.BITBANK_MOCK_CONTROL_TOKEN,
+    apiCredentials: credentials,
   });
 
   // 落とすときにロックを置いていかない。SIGKILL で残った分は次の起動が stale として奪う。
@@ -123,7 +139,7 @@ async function main() {
   console.log(
     `bitbank-lab-mock listening on http://${host}:${port} fillMode=${mode} ` +
       `persistFailure=${persistMode}${control ? " control=on" : ""}` +
-      `${clock === "virtual" ? " clock=virtual" : ""}`,
+      `${clock === "virtual" ? " clock=virtual" : ""}${credentials ? " auth=on" : ""}`,
   );
   // private stream は PubNub ではなく素の WebSocket なので、接続先を起動時に見せておく。
   console.log(`private stream: ws://${host}:${port}${PRIVATE_STREAM_PATH}`);

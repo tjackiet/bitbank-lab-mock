@@ -31,7 +31,7 @@ bitbank Private REST API と同じパスで、**発注・約定・取消・注�
 
 - **PubNub**: private stream は PubNub ではなく素の WebSocket で配信します。PubNub SDK のままでは繋がりません（下の「[private stream](#private-stream)」節）
 - **private stream の自然な入れ替わり**: モックは自分からは順序を入れ替えず、重複も欠落も起こしません（公式は順序を保証しません）。耐性を試すときは `/_control/stream/*` の保留・再送で、入れ替わり・重複・欠落を狙って起こします（下の「[`/_control/`](#_control)」節）
-- **認証ヘッダの検証**: どんなヘッダでも、無くても通ります。private stream の接続も同じです。本物の API キーを向けないでください
+- **既定での認証ヘッダの検証**: 既定ではどんなヘッダでも、無くても通ります。`BITBANK_MOCK_API_KEY` と `BITBANK_MOCK_API_SECRET` を両方設定したときだけ、互換ルートの署名を検証します（下の「[認証ヘッダの検証](#認証ヘッダの検証)」節）。private stream の接続と `/_control/` は、設定しても検証しません。本物の API キーとシークレットは向けないでください
 - **レート制限**: 回数を数える制限はありません。どれだけ叩いても、上限を超えたことによる 429（`10009`）は返りません。429 を受けたときの振る舞いを試すときは `/_control/faults` で注入します（下の「[`/_control/`](#_control)」節）
 - **注文訂正**: 発注後に価格や数量を変える口はありません
 
@@ -145,6 +145,32 @@ BITBANK_MOCK_CONTROL=1 npm run dev
 
 `curl` だけで動きます（JSON の取り出しは `sed` / `grep`）。**何度流しても同じ値が出るよう、先頭で `POST /_control/reset` を叩いて状態を捨てます。** 取っておきたいシナリオがあるときは `BITBANK_MOCK_STATE_PATH` を分けてください。
 
+### 認証ヘッダの検証
+
+既定では認証ヘッダを見ません。利用側のクライアントや、間に入る中継が付ける署名を本番の前に確かめたいときは、API キーとシークレットを**両方**渡して起動します。**ダミーの値を使ってください**（本物の API キーとシークレットは渡さないでください）。
+
+```bash
+BITBANK_MOCK_CONTROL=1 BITBANK_MOCK_API_KEY=dummy BITBANK_MOCK_API_SECRET=dummy npm run dev
+```
+
+起動の行に `auth=on` が出れば効いています。**片方だけ渡すと起動しません**（黙って検証なしで動くと、署名を確かめているつもりの実験が素通りになるため）。署名は公式どおり、シークレットを鍵にした HMAC-SHA256 の 16 進です。
+
+```bash
+# ACCESS-TIME-WINDOW 方式で GET /v1/user/assets を叩く（公式のサンプルと同じ組み立て方）
+T="$(date +%s)000"; W=5000; P=/v1/user/assets
+S="$(echo -n "$T$W$P" | openssl dgst -sha256 -hmac dummy | awk '{print $NF}')"
+curl -s "localhost:14000$P" -H "ACCESS-KEY: dummy" -H "ACCESS-REQUEST-TIME: $T" \
+  -H "ACCESS-TIME-WINDOW: $W" -H "ACCESS-SIGNATURE: $S"
+```
+
+- **公式の 2 方式**（ACCESS-TIME-WINDOW 方式と ACCESS-NONCE 方式）を受けます。署名は**要求行のパスとクエリ、届いた本文のバイト列を生のまま**比べるので、中継がクエリを並べ替えたり本文の JSON を整形し直したりすると、意味が同じでも断られます
+- 時刻の窓は**実時刻**で見ます（仮想時計で起動していても）。ACCESS-NONCE 方式の nonce は増え続ける必要があり、`POST /_control/reset` でも戻りません
+- 断るときは HTTP 200 + 封筒です（ヘッダが無い `20003`、キーが違う `20002`、署名が無い・合わない `20005`、時刻の窓の外 `20034` など）。**どの失敗にどの番号を返すかは推測です**
+- 対象は互換ルート（`/v1/user/...`。`GET /v1/user/subscribe` を含む）だけで、`/_control/` と private stream は検証しません。認証に通らない要求には、`/_control/faults` で登録した故障も当たらず、回数も減りません
+- ログには断った理由とメソッドとパスだけが出ます（シークレット・署名・署名対象の文字列は出しません）
+
+細則は [`docs/fidelity.md`](docs/fidelity.md) の「認証」の節にあります。
+
 ## 環境変数
 
 | 変数 | 既定 | 説明 |
@@ -155,6 +181,8 @@ BITBANK_MOCK_CONTROL=1 npm run dev
 | `BITBANK_MOCK_HOST` | control 有効時 `127.0.0.1`、無効時 `0.0.0.0` | listen アドレス |
 | `BITBANK_MOCK_PORT` | `14000` | listen ポート |
 | `BITBANK_MOCK_CONTROL_TOKEN` | 未設定 | 非ループバックからの `/_control/` に必要な `X-Control-Token` |
+| `BITBANK_MOCK_API_KEY` | 未設定（検証しない） | 認証ヘッダの検証に使う API キー。`BITBANK_MOCK_API_SECRET` と**両方**設定したときだけ互換ルートの認証ヘッダを検証し、**片方だけなら起動しない**。空文字は未設定。**本物のキーは使わない**（「[認証ヘッダの検証](#認証ヘッダの検証)」節） |
+| `BITBANK_MOCK_API_SECRET` | 未設定（検証しない） | 同じく API シークレット（署名の HMAC-SHA256 の鍵）。**本物のシークレットは使わない**。ログには出さない |
 | `BITBANK_MOCK_STREAM_ASSET_KEYS` | `camel` | private stream の `asset_update` のキーの綴り。`snake` のときだけ snake_case（`free_amount`）、それ以外は camelCase（`freeAmount`）。公式の表と例が食い違っているので、両方でパーサを試せるようにしてある |
 | `BITBANK_MOCK_PERSIST_FAILURE` | `degrade` | 状態ファイルへの書き出しに失敗した後の挙動。`degrade` は状態を変える要求を断り読み取りは生かす。`ignore` は v0.1.0 の挙動（何も断らない） |
 | `BITBANK_MOCK_STATE_PATH` | `~/.bitbank-mock/sessions/default/state.json` | 状態ファイルのパス |
@@ -274,7 +302,7 @@ curl -s -X POST localhost:14000/_control/clock -H 'content-type: application/jso
 ## 非目標（Plan A）
 
 - 公式 testnet / 動作保証 / 全 error code の網羅
-- 認証ヘッダの検証、回数を数えるレート制限（429 の注入はできます）、注文訂正
+- 認証のうち、API キーの権限（参照・取引）・IP アドレスの制限・複数のキー（署名の検証は `BITBANK_MOCK_API_KEY` と `BITBANK_MOCK_API_SECRET` で有効にできます）、回数を数えるレート制限（429 の注入はできます）、注文訂正
 - ダッシュボード、public REST の網羅、PubNub での配信
 - 障害注入のうち、時間で遅らせる注入・乱数での注入と、private stream の接続ごとの注入（REST の 429・5xx・応答不明は `/_control/faults` で、private stream の重複・順序入替・欠落は `/_control/stream/*` の保留・再送で、切断は全接続まとめて `/_control/stream/disconnect` で起こせます）
 
@@ -316,7 +344,7 @@ CI（`.github/workflows/ci.yml`）は Node 24 で `npm ci` → `npm run lint` �
 
 ### 安全対策の補助性
 
-本ツールに実装されているバリデーション、`/_control/` のアクセス制限その他の安全対策は、誤操作を減らすための補助機能であり、その完全な防止を保証するものではありません。Plan A では認証ヘッダを検証しません。本物の API キーを本モックに向けないでください。
+本ツールに実装されているバリデーション、`/_control/` のアクセス制限その他の安全対策は、誤操作を減らすための補助機能であり、その完全な防止を保証するものではありません。認証ヘッダは既定では検証せず、検証を有効にしても本物の API と同じ判定である保証はありません。本物の API キーとシークレットを本モックに向けたり、本モックに設定したりしないでください。
 
 ### 利用者の責任
 

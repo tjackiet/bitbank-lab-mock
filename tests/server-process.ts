@@ -42,6 +42,18 @@ export function collectStderr(child: ChildProcess): () => string {
   return () => text;
 }
 
+/**
+ * 子プロセスが標準出力へ出したもの（Fastify のログ）を集める。`waitUntilListening()` と同時に
+ * 使ってよい（`data` の購読者が 2 つになるだけで、取り合いにはならない）。
+ */
+export function collectStdout(child: ChildProcess): () => string {
+  let text = "";
+  child.stdout?.on("data", (chunk: Buffer) => {
+    text += chunk.toString();
+  });
+  return () => text;
+}
+
 /** 空いている TCP ポートを 1 つ借りる。固定ポートは他の実行とぶつかる。 */
 export function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -96,12 +108,15 @@ export function waitForExit(child: ChildProcess): Promise<void> {
  * **`fetch` ではなく `node:http` で話す。** テストからの `fetch` は宛先を問わず番人が止める
  * （`tests/network-guard.ts`。ローカルへ話すなら子プロセスか `node:http`、と同ファイルが書く）。
  * 宛先は `127.0.0.1` に固定する——プロキシの設定を読まないので、外へ回ることもない。
+ * `headers` は足したいもの（認証ヘッダなど）だけを渡す。本文は `JSON.stringify(body)` をそのまま送るので、
+ * POST の署名はその文字列に対して作る。
  */
 export function requestJson(
   port: number,
   method: "GET" | "POST",
   path: string,
   body?: unknown,
+  headers: Record<string, string> = {},
 ): Promise<{ status: number; body: unknown }> {
   const payload = body === undefined ? undefined : JSON.stringify(body);
   return new Promise((resolve, reject) => {
@@ -111,7 +126,10 @@ export function requestJson(
         port,
         method,
         path,
-        headers: payload === undefined ? {} : { "content-type": "application/json" },
+        headers: {
+          ...(payload === undefined ? {} : { "content-type": "application/json" }),
+          ...headers,
+        },
       },
       (res) => {
         let text = "";

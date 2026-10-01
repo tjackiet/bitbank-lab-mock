@@ -38,9 +38,17 @@ export default defineConfig({
      * 明示的に `baseUrl` を渡すテスト（`tests/engine/candles.test.ts`）はこれに影響されない
      * （`opts.baseUrl ?? process.env.BITBANK_PUBLIC_BASE_URL ?? DEFAULT_BASE_URL` の順）。
      * 既定が外向きであること自体は `tests/network-guard.test.ts` がこの値を外して確かめる。
+     *
+     * **認証のキーとシークレットは空にしておく。** モックを起こすのと同じ端末でこの 2 つを
+     * export したまま `npm test` を流すと、`buildServer()` が環境変数から読んで検証を有効にし、
+     * 認証ヘッダを付けない既存のテストが一斉に `20003` で落ちる。空文字は未設定として扱う
+     * （`src/server/config.ts` の `apiCredentials()`）。子プロセスにも同じ値が渡るので、検証を
+     * 有効にしたいテストは明示して上書きする（`tests/index.test.ts`）。
      */
     env: {
       BITBANK_PUBLIC_BASE_URL: "http://127.0.0.1:9",
+      BITBANK_MOCK_API_KEY: "",
+      BITBANK_MOCK_API_SECRET: "",
     },
 
     coverage: {

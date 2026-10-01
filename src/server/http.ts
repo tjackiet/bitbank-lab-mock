@@ -13,7 +13,14 @@ import { subscribeRoutes } from "../routes/subscribe.ts";
 import { tradeHistoryRoutes } from "../routes/trade-history.ts";
 import type { SessionStore } from "../store/session.ts";
 import { type DeliveryPolicy, PrivateStreamHub } from "../stream/hub.ts";
-import { controlToken, isControlEnabled, streamAssetKeys } from "./config.ts";
+import { AuthVerifier, registerAuth } from "./auth.ts";
+import {
+  type ApiCredentials,
+  apiCredentials,
+  controlToken,
+  isControlEnabled,
+  streamAssetKeys,
+} from "./config.ts";
 import { assertRouteClassified, degradedResponse, passesWhileDegraded } from "./degraded.ts";
 import { FaultInjector, registerFaultInjection } from "./faults.ts";
 
@@ -29,6 +36,11 @@ export type BuildServerOptions = {
   logger?: boolean;
   controlEnabled?: boolean;
   controlToken?: string;
+  /**
+   * 認証ヘッダを検証するときのキーとシークレット。`null` で検証しない。省略時は
+   * `BITBANK_MOCK_API_KEY` と `BITBANK_MOCK_API_SECRET`（両方あるときだけ検証する）。
+   */
+  apiCredentials?: ApiCredentials | null;
   /** 省略時は `BITBANK_MOCK_STREAM_ASSET_KEYS`（既定 `camel`）。 */
   streamAssetKeys?: AssetKeyStyle;
   /** 省略時は `passThrough`（恒等写像）。障害注入の差し込み口（`src/stream/hub.ts`）。 */
@@ -113,9 +125,10 @@ function registerDegradedGuard(fastify: FastifyInstance, store: SessionStore): v
  * **パスの打ち間違いが認証エラーに見える**。クライアントが `20003` を見て「キーが違う」と判断すると
  * 事故になるので、モックもここを再現する。
  *
- * モックが返すのは `20003` の側（認証ヘッダを検証しないので「キーが無い」状態に当たる）。
- * `20001` との出し分けはヘッダを見ることになり、README の「認証は非目標」に触れるので
- * しない（`docs/fidelity.md` の「封筒に包まれない応答」節に未対応として記録）。
+ * モックが返すのは `20003` の側（「キーが無い」状態に当たる）。**認証ヘッダの検証を有効にしても
+ * ここは変えない**——検証の対象は登録した互換ルートだけで（`docs/plan-lab-mock.md` 19.2 の決定 41）、
+ * 未登録のパスにはヘッダを見ずに `20003` を返す。`20001` との出し分けはしない
+ * （`docs/fidelity.md` の「封筒に包まれない応答」節に未対応として記録）。
  *
  * **`/_control/` は対象外**（bitbank API に存在しない実験用の口なので、封筒に包まず
  * Fastify の既定 404 のまま）。control を無効にして起動したときの `/_control/state` も
@@ -163,6 +176,17 @@ function registerPrivateStream(
 }
 
 /**
+ * 認証ヘッダの検証を足す（`src/server/auth.ts`）。**キーとシークレットがあるときだけ**——無ければ
+ * フックすら掛けない（既定の挙動を変えない。`docs/plan-lab-mock.md` 19.2 の決定 37）。
+ * **障害注入より先に呼ぶ**（同じ `preParsing` に足すフックは足した順に走る。決定 42）。
+ * 直近の nonce は検証器が持つので、サーバの寿命と同じだけ残る。
+ */
+function registerAuthIfEnabled(fastify: FastifyInstance, opts: BuildServerOptions): void {
+  const credentials = opts.apiCredentials !== undefined ? opts.apiCredentials : apiCredentials();
+  if (credentials !== null) registerAuth(fastify, new AuthVerifier(credentials));
+}
+
+/**
  * REST の障害注入を足す（`src/server/faults.ts`）。**control が有効なときだけ**——故障を登録する口が
  * `/_control/` にしか無いので、無効なら互換ルートにフックすら掛けない。互換ルートを登録する前に
  * 呼ぶ（`onRoute` で故障を当てられる経路を集める）。reset で登録を捨てるための store の購読は、
@@ -182,6 +206,7 @@ export async function buildServer(opts: BuildServerOptions): Promise<FastifyInst
   registerDegradedGuard(fastify, opts.store);
   registerNotFoundHandler(fastify);
   const hub = registerPrivateStream(fastify, opts);
+  registerAuthIfEnabled(fastify, opts);
   const enabled = opts.controlEnabled ?? isControlEnabled();
   const faults = enabled ? registerFaults(fastify, opts.store) : null;
   // WebSocket のルートを登録する前に入れる（`websocket: true` / `wsHandler` を解釈する
