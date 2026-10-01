@@ -11,7 +11,8 @@ import { freePort, spawnServer, waitForExit, waitUntilListening } from "../serve
  *
  * このスクリプトは README（「[試す](../../README.md)」の手順）と
  * `docs/plan-a-readiness.md` が**最初に流してほしい**と書いているデモで、`set -euo pipefail` と
- * `require_status()` で自分の期待も検査している。それでも**誰も走らせていなかった**ので、
+ * `require_status()` などで自分の期待も検査している。後半は private stream の切断の口
+ * （refuse → disconnect → accept）を curl だけで通す。それでも**誰も走らせていなかった**ので、
  * 応答の形が変わっても、経路の名前が変わっても、気付くのはこれを手で流した人だけだった。
  * 検査を持っているスクリプトを走らせないのは、検査を書いていないのと同じである。
  *
@@ -110,5 +111,9 @@ describe.skipIf(process.platform === "win32")("examples/scenario-plan-a.sh", () 
     expect(r.stdout).toContain("発注前の jpy");
     expect(r.stdout).toContain("発注後の jpy");
     expect(r.stdout).toContain("約定後の jpy");
+    // 後半の private stream の切断も、refuse の 503 から accept の後の 426 まで通っている。
+    expect(r.stdout).toContain('{"error":"STREAM_REFUSED"}（HTTP 503）');
+    expect(r.stdout).toContain("切断中の照合");
+    expect(r.stdout).toContain('{"error":"UPGRADE_REQUIRED"}（HTTP 426）');
   }, 40_000);
 });

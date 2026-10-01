@@ -16,7 +16,7 @@
 
 bitbank Private REST API と同じパスで、**発注・約定・取消・注文照会・残高照会**ができるモックサーバです。どれも 1 つの状態（注文・約定・仮想残高）を共有しているので、発注すると残高が拘束され、約定すると約定履歴と残高に反映され、取り消すと拘束が外れます。固定の応答を返すスタブではありません。状態の変化は **private stream**（WebSocket）でも push で受け取れます（下の「[private stream](#private-stream)」節）。状態はファイルに書き出し、再起動後も引き継ぎます（書き出しに失敗したときの扱いは「[環境変数](#環境変数)」節）。
 
-発注から約定、残高の変化までの一連は [`examples/scenario-plan-a.sh`](examples/scenario-plan-a.sh) で確かめられます。何がどこまでできるかを根拠つきで確かめるなら [`docs/plan-a-readiness.md`](docs/plan-a-readiness.md) の「2. このモックで何ができるか」を読んでください。
+発注から約定、残高の変化までの一連は [`examples/scenario-plan-a.sh`](examples/scenario-plan-a.sh) で確かめられます（後半では private stream を切り、切れている間も発注と照合が通ることも見ます）。何がどこまでできるかを根拠つきで確かめるなら [`docs/plan-a-readiness.md`](docs/plan-a-readiness.md) の「2. このモックで何ができるか」を読んでください。
 
 ### 約定エンジン
 
@@ -135,7 +135,7 @@ BITBANK_MOCK_CONTROL=1 npm run dev
 
 既定は `http://127.0.0.1:14000`（control 有効時。無効時は `0.0.0.0:14000`）。ポートは `BITBANK_MOCK_PORT`、または `serve` に続けて `--port`（`npm run dev -- serve --port 14001`）。**`--port` だけを渡すと `unknown command: --port` で起動しません**——引数の 1 つ目はサブコマンドとして読むためです。
 
-再現シナリオ（発注 → 拘束 → control fill → 残高減）:
+再現シナリオ（発注 → 拘束 → control fill → 残高減。後半で private stream の refuse → disconnect → 切断中の発注と照合 → accept）:
 
 ```bash
 BITBANK_MOCK_CONTROL=1 npm run dev
@@ -229,7 +229,7 @@ curl -s -X POST localhost:14000/_control/stream/accept      # 受け付ける状
 curl -s -X POST localhost:14000/_control/stream/release     # 切っていた間の変化を届ける
 ```
 
-受け付けない状態はメモリにだけあり、`POST /_control/reset` と再起動で受け付ける状態に戻ります。細則は [`docs/fidelity.md`](docs/fidelity.md) の「private stream の切断」の節にあります。
+受け付けない状態はメモリにだけあり、`POST /_control/reset` と再起動で受け付ける状態に戻ります。WebSocket を張らずに curl だけで流せる部分（refuse・disconnect・切断中の 503・accept）は [`examples/scenario-plan-a.sh`](examples/scenario-plan-a.sh) の後半にあります。細則は [`docs/fidelity.md`](docs/fidelity.md) の「private stream の切断」の節にあります。
 
 **REST の 429・5xx・応答不明は、`/_control/faults` で起こします。** 互換ルートの（メソッド, パス）ごとに、次の何回にどの故障を起こすかを登録します。同じ（メソッド, パス）に複数登録すると、登録した順に使い切ります。乱数も時間も使わないので、同じシナリオは毎回同じ結果になります。
 
