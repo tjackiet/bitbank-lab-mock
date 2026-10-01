@@ -16,7 +16,7 @@
 
 bitbank Private REST API と同じパスで、**発注・約定・取消・注文照会・残高照会**ができるモックサーバです。どれも 1 つの状態（注文・約定・仮想残高）を共有しているので、発注すると残高が拘束され、約定すると約定履歴と残高に反映され、取り消すと拘束が外れます。固定の応答を返すスタブではありません。状態の変化は **private stream**（WebSocket）でも push で受け取れます（下の「[private stream](#private-stream)」節）。状態はファイルに書き出し、再起動後も引き継ぎます（書き出しに失敗したときの扱いは「[環境変数](#環境変数)」節）。
 
-発注から約定、残高の変化までの一連は [`examples/scenario-plan-a.sh`](examples/scenario-plan-a.sh) で確かめられます（後半では private stream を切り、切れている間も発注と照合が通ることも見ます）。何がどこまでできるかを根拠つきで確かめるなら [`docs/plan-a-readiness.md`](docs/plan-a-readiness.md) の「2. このモックで何ができるか」を読んでください。
+発注から約定、残高の変化までの一連は [`examples/scenario-plan-a.sh`](examples/scenario-plan-a.sh) で確かめられます（後半では private stream を切り、切れている間も発注と照合が通ることも見ます）。MCP サーバ（bitbank-lab-mcp）の研究用の起動口からこのモックまでを通す確認は [`examples/scenario-mcp-lab.mjs`](examples/scenario-mcp-lab.mjs) です（「[MCP からモックまでを通す確認](#mcp-からモックまでを通す確認)」節）。何がどこまでできるかを根拠つきで確かめるなら [`docs/plan-a-readiness.md`](docs/plan-a-readiness.md) の「2. このモックで何ができるか」を読んでください。
 
 ### 約定エンジン
 
@@ -145,6 +145,29 @@ BITBANK_MOCK_CONTROL=1 npm run dev
 
 `curl` だけで動きます（JSON の取り出しは `sed` / `grep`）。**何度流しても同じ値が出るよう、先頭で `POST /_control/reset` を叩いて状態を捨てます。** 取っておきたいシナリオがあるときは `BITBANK_MOCK_STATE_PATH` を分けてください。
 
+### MCP からモックまでを通す確認
+
+MCP サーバ [`tjackiet/bitbank-lab-mcp`](https://github.com/tjackiet/bitbank-lab-mcp) には、private API の接続先をこのモックへ向ける研究用の起動口（`lab/start.ts`）があります。[`examples/scenario-mcp-lab.mjs`](examples/scenario-mcp-lab.mjs) はその起動口で MCP を起こして MCP のツールを呼び、MCP → モックの経路が通ることを確かめます。見るのは、確認を経た発注と取消、確認で断ると発注されないこと、部分約定、仮想時計の時刻、応答不明（`no_response`）、429 からの再試行、private stream の 12 項目です。
+
+前提は 2 つです。欠けていれば、確認を始める前にわかる言葉で止まります（終了コード 2）。
+
+- **MCP の checkout を `66d9a69` 以降にして `npm ci` しておく。** Node.js 22 以上が要ります（MCP も 22 以上を求め、スクリプトはグローバルの `WebSocket` を使います）
+- **モックを `BITBANK_MOCK_CONTROL=1 BITBANK_MOCK_CLOCK=virtual` で起動しておく**
+
+```bash
+BITBANK_MOCK_CONTROL=1 BITBANK_MOCK_CLOCK=virtual npm run dev
+# 別端末
+MCP_LAB_DIR=<bitbank-lab-mcp の checkout> node examples/scenario-mcp-lab.mjs
+```
+
+全部通れば `12/12 OK` と出て終了コード 0、NG があれば 1 です。`scenario-plan-a.sh` と同じく、先頭で `POST /_control/reset` を叩いて状態を捨てます。
+
+- **MCP の確認（elicitation）には、このスクリプトが人の代わりに自動で応えます。** MCP は発注と取消の前に確認への応答を必須にしていて、応えるのはクライアント側の役目だからです。確認の扱いの正は MCP の [`lab/README.md`](https://github.com/tjackiet/bitbank-lab-mcp/blob/main/lab/README.md) です
+- MCP に渡すキーとシークレットは `MCP_LAB_API_KEY` / `MCP_LAB_API_SECRET` で、既定はダミーの `lab-key` / `lab-secret` です。**シェルの `BITBANK_API_KEY` / `BITBANK_API_SECRET` は読みません**——本番に MCP を繋いでいると本物の鍵が入っていることがあるので、MCP には常にこの 2 つで上書きして渡します
+- 認証ヘッダの検証まで通すときは、モックを同じ値で起動します（`BITBANK_MOCK_API_KEY=lab-key BITBANK_MOCK_API_SECRET=lab-secret` を足す）。シークレットが違えば 1 が「署名が無効です」で NG になり、注文を出さずにそこで止まります（終了コード 1）
+- 叩き先は `BITBANK_MOCK_URL` で変えられます（ループバックだけ。MCP の起動口もループバック以外を断ります）
+- 判定は MCP の表示文言ではなく、MCP の `structuredContent` とモックの `GET /_control/state` で見ます。MCP `66d9a69` の応答の形に依存するところは、スクリプトの冒頭に書いてあります
+
 ### 認証ヘッダの検証
 
 既定では認証ヘッダを見ません。利用側のクライアントや、間に入る中継が付ける署名を本番の前に確かめたいときは、API キーとシークレットを**両方**渡して起動します。**ダミーの値を使ってください**（本物の API キーとシークレットは渡さないでください）。
@@ -188,7 +211,7 @@ curl -s "localhost:14000$P" -H "ACCESS-KEY: dummy" -H "ACCESS-REQUEST-TIME: $T" 
 | `BITBANK_MOCK_STATE_PATH` | `~/.bitbank-mock/sessions/default/state.json` | 状態ファイルのパス |
 | `BITBANK_MOCK_HOME` | `~/.bitbank-mock` | `STATE_PATH` 未指定時のルート |
 | `BITBANK_PUBLIC_BASE_URL` | `https://public.bitbank.cc` | 足を取りに行く公開 API のベース URL（`BITBANK_MOCK_FILL_MODE=market` のときだけ使う） |
-| `BITBANK_MOCK_URL` | `http://127.0.0.1:14000` | **サーバは読みません。** `examples/scenario-plan-a.sh` が叩き先として読みます。既定以外のポートで起動したときに使ってください |
+| `BITBANK_MOCK_URL` | `http://127.0.0.1:14000` | **サーバは読みません。** `examples/scenario-plan-a.sh` と `examples/scenario-mcp-lab.mjs`（ループバックだけ）が叩き先として読みます。既定以外のポートで起動したときに使ってください |
 
 状態ファイルは起動時に検査します。JSON が壊れている・スキーマに合わない場合に加えて、[`docs/fidelity.md`](docs/fidelity.md) の「状態の不変量（PaperState v3）」のうち単一の状態から判定できるもの（不変量 1〜3・5・6）を破っている場合も**起動しません**（自動修復も初期化もしません。ファイルはそのまま残します）。エラーには破れた不変量の番号と、その対象を特定する識別子が出ます（不変量 1〜3・5 は注文 ID、注文の無い trade は trade ID、不変量 6 は資産キー）。
 
