@@ -547,9 +547,14 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
    */
   fastify.post("/stream/hold", async () => fastify.privateStream.hold());
 
-  /** 保留の状況と、溜めたメッセージを溜めた順に番号（`seq`、1 から）付きで返す。 */
+  /**
+   * 保留の状況と、溜めたメッセージを溜めた順に番号（`seq`、1 から）付きで返す。新しい接続を
+   * 受け付けているか（`accepting`。下の refuse / accept）も添える——確かめる口を別に作らず、
+   * stream の実験の様子を 1 回で読めるようにするため。
+   */
   fastify.get("/stream/held", async () => ({
     ...fastify.privateStream.holdStatus(),
+    accepting: fastify.privateStream.isAccepting(),
     messages: fastify.privateStream.heldMessages(),
   }));
 
@@ -585,6 +590,38 @@ export const controlRoutes: FastifyPluginAsync<ControlRouteOptions> = async (fas
       return reply.code(409).send({ error: "NO_STREAM_CLIENTS", held: hub.holdStatus().held });
     }
     return invalid();
+  });
+
+  /*
+   * private stream の切断。状態を残したまま接続を切り、切ったまま繋がらない時間を作るための口
+   * （`docs/fidelity.md` の「private stream の切断」節）。受け付けるかどうかは hub のメモリにあり、
+   * `PaperState` にも状態ファイルにも入らない。そのため劣化中も通す
+   * （`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。reset で受け付ける状態に戻る。
+   *
+   * 切ったまま保つなら **refuse → disconnect の順**に呼ぶ。逆だと、その間に利用側が繋ぎ直し得る。
+   */
+
+  /**
+   * 接続中の全員を close code 1001 で閉じ、閉じた数を `{ closed }` で返す。0 本でも 200
+   * （失うものが無い）。状態・保留・溜めたもの・受け付けるかどうかには触れない。本文は読まない。
+   */
+  fastify.post("/stream/disconnect", async () => ({
+    closed: fastify.privateStream.disconnectAll(),
+  }));
+
+  /**
+   * 新しい接続を受け付けない状態にする（`GET /_stream/private` が 503 になる）。今の接続は
+   * 閉じない。何度呼んでも同じ応答 `{ accepting: false }`。本文は読まない。
+   */
+  fastify.post("/stream/refuse", async () => {
+    fastify.privateStream.refuse();
+    return { accepting: fastify.privateStream.isAccepting() };
+  });
+
+  /** 受け付ける状態に戻す。何度呼んでも同じ応答 `{ accepting: true }`。本文は読まない。 */
+  fastify.post("/stream/accept", async () => {
+    fastify.privateStream.accept();
+    return { accepting: fastify.privateStream.isAccepting() };
   });
 
   /*

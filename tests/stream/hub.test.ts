@@ -6,6 +6,8 @@ import { type PrivateStreamMessage, stateChangeMessages } from "../../src/stream
 import {
   DEFAULT_HOLD_LIMIT,
   type DeliveryPolicy,
+  DISCONNECT_CLOSE_CODE,
+  DISCONNECT_CLOSE_REASON,
   PrivateStreamHub,
   RESET_CLOSE_CODE,
   RESET_CLOSE_REASON,
@@ -524,5 +526,142 @@ describe("PrivateStreamHub の保留・再送", () => {
     expect(() => new PrivateStreamHub(newStore(), { assetKeys: "camel", holdLimit })).toThrow(
       RangeError,
     );
+  });
+});
+
+/** 切断（`disconnectAll()`）と、新しい接続を受け付けない状態（`refuse()` / `accept()`）。 */
+describe("PrivateStreamHub の切断", () => {
+  function started(deliveryPolicy?: DeliveryPolicy) {
+    const store = newStore();
+    const hub = new PrivateStreamHub(store, { assetKeys: "camel", deliveryPolicy });
+    hub.start();
+    const place = () => {
+      const prev = store.state();
+      const next = placed(prev);
+      store.replace(next);
+      return stateChangeMessages(prev, next, { feeRate: 0, assetKeys: "camel" });
+    };
+    return { store, hub, place };
+  }
+
+  it("disconnectAll は全員を 1001 で閉じて外し、閉じた数を返す。以後の変化は届かない", () => {
+    const { hub, place } = started();
+    const a = recorder();
+    const b = recorder();
+    hub.addClient(a.client);
+    hub.addClient(b.client);
+
+    expect(hub.disconnectAll()).toBe(2);
+    const closed = { code: DISCONNECT_CLOSE_CODE, reason: DISCONNECT_CLOSE_REASON };
+    expect(closed).toEqual({ code: 1001, reason: "disconnected by /_control/stream/disconnect" });
+    expect(a.closed).toEqual([closed]);
+    expect(b.closed).toEqual([closed]);
+    expect(hub.clientCount()).toBe(0);
+
+    place();
+    expect(a.sent).toEqual([]);
+    expect(b.sent).toEqual([]);
+  });
+
+  it("購読者が 0 人なら 0 を返し、2 回目も投げない", () => {
+    const { hub } = started();
+    expect(hub.disconnectAll()).toBe(0);
+    hub.addClient(recorder().client);
+    expect(hub.disconnectAll()).toBe(1);
+    expect(hub.disconnectAll()).toBe(0);
+  });
+
+  it("閉じ損ねた購読者も外し、閉じた数に入れる", () => {
+    const { hub } = started();
+    hub.addClient({
+      send: () => {},
+      close: () => {
+        throw new Error("already closed");
+      },
+    });
+    const ok = recorder();
+    hub.addClient(ok.client);
+    expect(hub.disconnectAll()).toBe(2);
+    expect(hub.clientCount()).toBe(0);
+    expect(ok.closed).toHaveLength(1);
+  });
+
+  it("状態にも、受け付けるかどうかにも触れない", () => {
+    const { store, hub, place } = started();
+    hub.addClient(recorder().client);
+    place();
+    const before = store.state();
+    hub.refuse();
+    hub.disconnectAll();
+    expect(store.state()).toBe(before);
+    expect(hub.isAccepting()).toBe(false);
+    hub.accept();
+    hub.disconnectAll();
+    expect(hub.isAccepting()).toBe(true);
+  });
+
+  it("保留していなければ、切っている間の変化はメッセージも作らず、繋ぎ直しても届かない", () => {
+    const policy = vi.fn<DeliveryPolicy>((ms) => ms);
+    const { hub, place } = started(policy);
+    hub.addClient(recorder().client);
+    hub.disconnectAll();
+    place();
+    expect(policy).not.toHaveBeenCalled();
+
+    const again = recorder();
+    hub.addClient(again.client);
+    expect(again.sent).toEqual([]);
+    const after = place();
+    expect(again.sent).toEqual(after);
+  });
+
+  it("保留も溜めたものも残すので、切る前に hold して繋ぎ直してから release すれば、切っていた間の変化が届く", () => {
+    const { hub, place } = started();
+    const r = recorder();
+    hub.addClient(r.client);
+    hub.hold();
+    const before = place(); // 切る前の変化（保留中なので溜まる）
+    expect(hub.disconnectAll()).toBe(1);
+    expect(hub.holdStatus()).toMatchObject({ holding: true, held: before.length });
+
+    const during = place(); // 切っている間の変化。購読者は 0 人だが溜まる
+    expect(hub.heldMessages().map((m) => m.frame)).toEqual([...before, ...during]);
+    expect(hub.release()).toEqual({ success: false, error: "NO_CLIENTS" });
+
+    const again = recorder();
+    hub.addClient(again.client);
+    expect(hub.release()).toEqual({
+      success: true,
+      data: { sent: before.length + during.length, omitted: [], clients: 1 },
+    });
+    expect(again.sent).toEqual([...before, ...during]);
+    // 切った接続には何も届かない。
+    expect(r.sent).toEqual([]);
+  });
+
+  it("refuse と accept は何度呼んでも同じ結果で、今の接続は閉じない", () => {
+    const { hub, place } = started();
+    expect(hub.isAccepting()).toBe(true);
+    const r = recorder();
+    hub.addClient(r.client);
+
+    hub.refuse();
+    hub.refuse();
+    expect(hub.isAccepting()).toBe(false);
+    expect(r.closed).toEqual([]);
+    // 受け付けないのは新しい接続だけで、今の接続には送り続ける。
+    const messages = place();
+    expect(r.sent).toEqual(messages);
+
+    hub.accept();
+    hub.accept();
+    expect(hub.isAccepting()).toBe(true);
+  });
+
+  it("reset は受け付ける状態に戻す", async () => {
+    const { store, hub } = started();
+    hub.refuse();
+    await store.reset(buildState());
+    expect(hub.isAccepting()).toBe(true);
   });
 });
