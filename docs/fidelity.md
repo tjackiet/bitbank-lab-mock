@@ -69,6 +69,7 @@ API 担当レビュー後に「確認済み／要修正」列を足す。private
 - [private stream](#private-stream) — WebSocket の口 `GET /_stream/private` を足し、状態の変化を公式と同じ形のメッセージで配信する（改訂前: 口が無く、未登録パスとして HTTP 404 + 封筒 `10000`）
 - [private stream と状態の初期化](#private-stream-と状態の初期化) — `POST /_control/reset` が private stream の接続をすべて close code `1012` で閉じる（HTTP の応答は変えていない）
 - [private stream の保留・再送](#private-stream-の保留再送) — `POST /_control/stream/hold` / `GET /_control/stream/held` / `POST /_control/stream/release` を足し、private stream の順序の入れ替わり・重複・欠落を `/_control/` から起こせるようにした（改訂前: 起こす手段が無く、常に発生順に 1 回ずつ届いた）
+- [private stream の切断](#private-stream-の切断) — `POST /_control/stream/disconnect` / `POST /_control/stream/refuse` / `POST /_control/stream/accept` を足し、状態と保留を残したまま全接続を close code `1001` で閉じ、新しい接続を upgrade の前に HTTP 503 で断れるようにした（`GET /_control/stream/held` に `accepting` を足した。改訂前: 接続を狙って切る口は状態も作り直す `POST /_control/reset`〔`1012`〕だけで、新しい接続を断る手段は無かった。**control を有効にしてこの口を叩かない限り、挙動は変わらない**）
 
 ### 永続化と起動
 
@@ -726,7 +727,7 @@ Plan A は認証ヘッダを検証しない。private stream の WebSocket（`/_
 
 ### `/_control/`
 
-`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/orders/:id/reject`（`UNFILLED` / `INACTIVE` の注文を `REJECTED` にする。下の段落）、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`POST /_control/stream/hold`・`GET /_control/stream/held`・`POST /_control/stream/release`（private stream の保留・再送。同じ表の「private stream の保留・再送」節）、`POST /_control/faults`・`GET /_control/faults`・`DELETE /_control/faults/:id`・`DELETE /_control/faults`（REST の障害注入。同じ表の「REST の障害注入」節）、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。仮想時計のときは `clock: { mode: "virtual" }` も添える（同じ表の「仮想時計」節。実時刻モードでは付けない）。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。保留・再送の 3 つと障害注入の 4 つは状態ファイルに書かないので劣化中も通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。`reset` は private stream の接続をすべて閉じる（同じ表の「private stream と状態の初期化」節）
+`BITBANK_MOCK_CONTROL=1` のときだけ登録する。素の JSON（bitbank 封筒ではない）。`POST /_control/orders/:id/fill`、`POST /_control/orders/:id/reject`（`UNFILLED` / `INACTIVE` の注文を `REJECTED` にする。下の段落）、`POST /_control/tick`、`POST /_control/clock`、`POST /_control/reset`、`POST /_control/stream/hold`・`GET /_control/stream/held`・`POST /_control/stream/release`（private stream の保留・再送。同じ表の「private stream の保留・再送」節）、`POST /_control/stream/disconnect`・`POST /_control/stream/refuse`・`POST /_control/stream/accept`（private stream の切断と、新しい接続を受け付けない状態。同じ表の「private stream の切断」節）、`POST /_control/faults`・`GET /_control/faults`・`DELETE /_control/faults/:id`・`DELETE /_control/faults`（REST の障害注入。同じ表の「REST の障害注入」節）、`GET /_control/state`（`PaperState` に、状態ファイルへの書き出しの状況 `persist` と足の取得の状況 `candles` を添えて返す。同じ表の「足の取得の健全性」節。仮想時計のときは `clock: { mode: "virtual" }` も添える（同じ表の「仮想時計」節。実時刻モードでは付けない）。どちらも `PaperState` の一部ではないが、`PaperStateSchema` は不明なキーを落とすので、この応答をそのまま状態ファイルへ書き戻しても読み込みは通る）。無効時はルート自体を登録しないので、メソッド・パスによらず Fastify の既定 404（本文も他の未登録パスと同じ）。有効時は、非ループバックから見ると登録済みの（メソッド, パス）が 403、未登録が 404 になるので、どの口が在るかは区別できる。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が **503 `{"error":"PERSIST_DEGRADED"}`** になる（`GET /state` は通る。同じ表の「状態の永続化」）。保留・再送の 3 つ、切断の 3 つ、障害注入の 4 つは状態ファイルに書かないので劣化中も通す（`src/server/degraded.ts` の `NON_PERSISTING_CONTROL_ROUTES`）。`reset` は private stream の接続をすべて閉じ、受け付けない状態も戻す（同じ表の「private stream と状態の初期化」節）
 
 **`reject` は `fill` と対になる口である。** 本文は読まず、`UNFILLED` / `INACTIVE` の注文を `REJECTED` にして、`{ "order": … }` を返す（`order` は `fill` の応答の `order` と同じ形で、値は同じ時点の `GET order` と同じ。約定は起きないので `trade` は持たない）。存在しない注文は 404 `{"error":"ORDER_NOT_FOUND"}`、それ以外の状態は 409 `{"error":"ORDER_NOT_ACTIVE","status":…}` で、どちらも状態を変えない。**部分約定済みの注文を断るのは不変量 2**（`REJECTED` の約定量は 0。下の「6 本の不変量」）のためで、約定した分を残して止めたいなら取消（`CANCELED_PARTIALLY_FILLED`）を使う。残高は動かさず、拘束だけが外れる（拘束は active な注文から計算する）。取消ではないので `canceled_at` は埋めず、拒否した時刻は REST の応答に出ない。private stream には `REJECTED` の `spot_order` と、拘束が外れた資産の `asset_update` が流れる（保留中なら他のメッセージと同じく溜まる。同じ表の「private stream の注文ペイロード」節）
 
@@ -937,7 +938,18 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream
 
-**素の WebSocket で配信する（PubNub を模さない）。** 接続先は `ws://<host>:<port>/_stream/private`（listen アドレスとポートは互換ルートと同じ）。`GET /v1/user/subscribe` は公式と同じ形 `{ "success": 1, "data": { "pubnub_channel", "pubnub_token" } }` を返すが、**値はダミーの固定文字列**で、WebSocket の接続ではどちらも見ない。送るメソッドは現物の 4 つ（`spot_order_new` / `spot_order` / `spot_trade` / `asset_update`）で、`spot_order_invalidation` は送らない（下の「private stream の `spot_order_invalidation`」節）。**接続した時点の状態は送らない**——接続の後に起きた変化だけが届く（**例外は保留・再送**で、保留の後に繋いだ接続にも、release で繋ぐ前の変化が届く。下の「private stream の保留・再送」節）。クライアントから送られたフレームは読まずに捨て、1024 バイトを超えるフレームには close code `1009` で閉じる。upgrade でない `GET /_stream/private` には HTTP `426` と素の JSON `{"error":"UPGRADE_REQUIRED"}` を返す
+**素の WebSocket で配信する（PubNub を模さない）。** 接続先は `ws://<host>:<port>/_stream/private`（listen アドレスとポートは互換ルートと同じ）。`GET /v1/user/subscribe` は公式と同じ形 `{ "success": 1, "data": { "pubnub_channel", "pubnub_token" } }` を返すが、**値はダミーの固定文字列**で、WebSocket の接続ではどちらも見ない。送るメソッドは現物の 4 つ（`spot_order_new` / `spot_order` / `spot_trade` / `asset_update`）で、`spot_order_invalidation` は送らない（下の「private stream の `spot_order_invalidation`」節）。**接続した時点の状態は送らない**——接続の後に起きた変化だけが届く（**例外は保留・再送**で、保留の後に繋いだ接続にも、release で繋ぐ前の変化が届く。下の「private stream の保留・再送」節）。クライアントから送られたフレームは読まずに捨て、1024 バイトを超えるフレームには close code `1009` で閉じる。upgrade でない `GET /_stream/private` には HTTP `426` と素の JSON `{"error":"UPGRADE_REQUIRED"}` を返す。**新しい接続を受け付けない間（`POST /_control/stream/refuse` の後）は、upgrade の前に HTTP `503` と素の JSON `{"error":"STREAM_REFUSED"}` で断る**（upgrade かどうかに関わらず、`426` より先に判定する。下の「private stream の切断」節）
+
+**モックが接続を切るのは次の場合だけ**で、close code で区別できる。
+
+| close code | いつ | 状態 | 節 |
+| --- | --- | --- | --- |
+| `1001`（Going Away） | `POST /_control/stream/disconnect`（reason は `disconnected by /_control/stream/disconnect`） | 変えない（保留も溜めたものも残す） | 下の「private stream の切断」節 |
+| `1009`（Message Too Big） | クライアントから 1024 バイトを超えるフレームが来たとき（`ws` の `maxPayload`） | 変えない | この節 |
+| `1011`（Internal Error） | その接続へ送れなかったとき（reason は `send failed`。他の接続へは送り続ける） | 変えない | — |
+| `1012`（Service Restart） | `POST /_control/reset`（reason は `state reset by /_control/reset`） | 作り直す（注文 id を 1 から配り直し、保留も解く） | 下の「private stream と状態の初期化」節 |
+
+このほか、モックのプロセスを止めるときは close code を付けずに閉じる（クライアントには `1005` に見える。`@fastify/websocket` の既定の閉じ方）
 
 - **根拠**: 公式 private stream（`private-stream.md`）のメッセージ形と、REST の Get channel and token for private stream（`rest-api.md:1772-1824` / `rest-api_JP.md:1785-1790`。フィールドは `pubnub_channel` / `pubnub_token` の 2 つ、チャンネルはユーザーごと、トークンの TTL は 12 時間）。トランスポートの決定は計画書 3.4（2026-09-11）
 - **本物との差異**: 接続・配信のトランスポートが異なる（公式は PubNub SDK で購読する）。チャンネル名とトークンを検証せず、トークンの期限切れ（公式は 12 時間で切断）も起こさない。`GET /v1/user/subscribe` は**`store.tick()` を呼ばない唯一の互換ルート**で、状態を読まない（tick すると、再接続の手順の途中のまだ繋がっていない窓で約定のイベントが流れて取りこぼされるため。`src/routes/subscribe.ts`）。`/_stream/private` は bitbank API に存在しない口で、認証も接続元の制限も無い（互換ルートと同じ扱い。上の「認証」節）
@@ -998,7 +1010,7 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream と永続化の失敗
 
-**イベントはメモリへ反映した直後に送り、書き出しの成否も HTTP 応答も待たない。** そのため (a) 発注の HTTP 応答より先に `spot_order_new` が届くことがあり、(b) 書き出しに失敗して `70001` を返した要求（劣化の引き金になった 1 本）のイベントも流れる。劣化した後は状態を変える要求が断られ `tick()` も止まるので、**以後は何も流れない**（接続は断らない。`GET /_stream/private` は劣化中も通す読み取り経路に入れてある）。保留中だった場合、劣化の前に溜めたもの（(b) の 1 本のイベントを含む）は**劣化中も release で取り出せる**（保留・再送の 3 つは劣化中も通す。下の「private stream の保留・再送」節）
+**イベントはメモリへ反映した直後に送り、書き出しの成否も HTTP 応答も待たない。** そのため (a) 発注の HTTP 応答より先に `spot_order_new` が届くことがあり、(b) 書き出しに失敗して `70001` を返した要求（劣化の引き金になった 1 本）のイベントも流れる。劣化した後は状態を変える要求が断られ `tick()` も止まるので、**以後は何も流れない**（接続は劣化を理由には断らない。`GET /_stream/private` は劣化中も通す読み取り経路に入れてある。劣化の前に `POST /_control/stream/refuse` していれば、その 503 は劣化中も効き、`accept` で戻せる。下の「private stream の切断」節）。保留中だった場合、劣化の前に溜めたもの（(b) の 1 本のイベントを含む）は**劣化中も release で取り出せる**（保留・再送の 3 つは劣化中も通す。下の「private stream の保留・再送」節）
 
 - **根拠**: 本モック固有（計画書 16 節の決定 14）。書き出しの失敗の扱いそのものは上の「状態の永続化」節
 - **本物との差異**: 本物に対応する概念が無い。HTTP 応答と stream の到着順は、公式も何も保証していない
@@ -1008,7 +1020,7 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 
 ### private stream と状態の初期化
 
-`POST /_control/reset` は**イベントを 1 つも送らず、接続中の private stream をすべて close code `1012`（Service Restart）で閉じる**（reason は `state reset by /_control/reset`）。reset の後に繋ぎ直した接続には、以後の変化が通常どおり届く。**保留中なら溜めたものを捨て、保留も解く**（前の注文のメッセージを、id を配り直した後に届けないため。前の実験で保留を解き忘れていても、シナリオの冒頭の reset で通常の配信に戻る。下の「private stream の保留・再送」節）
+`POST /_control/reset` は**イベントを 1 つも送らず、接続中の private stream をすべて close code `1012`（Service Restart）で閉じる**（reason は `state reset by /_control/reset`）。reset の後に繋ぎ直した接続には、以後の変化が通常どおり届く。**保留中なら溜めたものを捨て、保留も解く**（前の注文のメッセージを、id を配り直した後に届けないため。前の実験で保留を解き忘れていても、シナリオの冒頭の reset で通常の配信に戻る。下の「private stream の保留・再送」節）。**新しい接続を受け付けない状態（`POST /_control/stream/refuse`）も、受け付ける状態に戻す**（保留と同じく、前の実験の残りを次のシナリオへ持ち越さない。シナリオの冒頭で reset すれば、refuse を解き忘れていても繋がる。下の「private stream の切断」節）
 
 - **根拠**: 本モック固有。reset は bitbank API に無い操作で、公式にも「状態が丸ごと入れ替わった」を表すメソッドは無い
 - **本物との差異**: 本物に対応する操作が無い
@@ -1033,7 +1045,7 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
 | 口 | 応答 |
 | --- | --- |
 | `POST /_control/stream/hold` | `{ holding, held, limit, overflowed, dropped }`（保留の状況）。**既に保留中なら何もしない**（溜めたものも番号も保つ）。本文は読まない |
-| `GET /_control/stream/held` | 保留の状況に `messages: [{ seq, frame }]` を足したもの。`frame` は WebSocket の 1 フレームに載る JSON そのもの。保留していなければ `holding: false` で `messages` は空 |
+| `GET /_control/stream/held` | 保留の状況に `accepting`（新しい接続を受け付けているか。下の「private stream の切断」節）と `messages: [{ seq, frame }]` を足したもの。`frame` は WebSocket の 1 フレームに載る JSON そのもの。保留していなければ `holding: false` で `messages` は空 |
 | `POST /_control/stream/release` | `{ sent, omitted, clients }`（送った通数〔重複の分も数える〕・指定しなかった番号・送った時点の接続数。`clients` が `0` になるのは送った通数も `0` のときだけ） |
 
 - **送る相手は release の時点で接続している全員**で、接続ごとに変えない。**保留の後に繋いだ接続にも、繋ぐ前の変化が届く**——上の「private stream」節の「接続した後の変化だけが届く」の**例外**である
@@ -1054,7 +1066,40 @@ v1 / v2 の状態ファイルを v3 へ移行する変換は決定的で、移�
   - 確認先 **モックの設計判断**: 上限（10,000 通）に達したら以後の変化を溜めずに印と落とした通数を残し、release を断り、状態を変える要求は断らないこと
   - 確認先 **モックの設計判断**: reset で溜めたものを捨て、保留も解くこと
   - 確認先 **モックの設計判断**: 書き出しに失敗した後の劣化中も hold / held / release を通すこと
-- **利用側への含意**: 「単調性」と「終端の優先」は、部分約定と全量約定の間で保留して release の並びを入れ替える（`FULLY_FILLED` の `spot_order` の後に `PARTIALLY_FILLED` の `spot_order`）か、同じ番号を 2 度書いて踏む。「fail-closed」は保留したまま release しない間に踏める（stream は届かないが、REST の照合と状態を変える要求は通る）。利用側が止まっている間の変化は、切断中に保留して変化を起こし、繋ぎ直してから release すれば届けられる（繋ぐ前に release すると 409 `NO_STREAM_CLIENTS` で断られ、溜めたものは残るので、繋いでから送り直す）。溢れたら reset からやり直す。シナリオの冒頭で reset すれば、前の実験で解き忘れた保留は持ち越さない
+- **利用側への含意**: 「単調性」と「終端の優先」は、部分約定と全量約定の間で保留して release の並びを入れ替える（`FULLY_FILLED` の `spot_order` の後に `PARTIALLY_FILLED` の `spot_order`）か、同じ番号を 2 度書いて踏む。「fail-closed」は保留したまま release しない間に踏める（stream は届かないが、REST の照合と状態を変える要求は通る）。利用側が止まっている間の変化は、切断中（下の「private stream の切断」節）に保留して変化を起こし、繋ぎ直してから release すれば届けられる（繋ぐ前に release すると 409 `NO_STREAM_CLIENTS` で断られ、溜めたものは残るので、繋いでから送り直す）。溢れたら reset からやり直す。シナリオの冒頭で reset すれば、前の実験で解き忘れた保留は持ち越さない
+
+### private stream の切断
+
+**`/_control/` から、状態と保留を残したまま private stream の接続をすべて切り、新しい接続を受け付けない時間を作れる**（計画書 18.2 の要判断事項 35）。reset（上の「private stream と状態の初期化」節）と違って、注文も id も保留も残る。3 つとも本文は読まない。
+
+| 口 | 動作 | 応答 |
+| --- | --- | --- |
+| `POST /_control/stream/disconnect` | 接続中の全員を close code `1001`（reason は `disconnected by /_control/stream/disconnect`）で閉じる。**状態・保留・溜めたもの・受け付けるかどうかには触れない** | `{ "closed": n }`（閉じた接続の数）。**接続が 0 本でも 200**（失うものが無い） |
+| `POST /_control/stream/refuse` | 新しい接続を受け付けない状態にする。**今の接続は閉じない**（切るのは disconnect） | `{ "accepting": false }`。何度呼んでも同じ |
+| `POST /_control/stream/accept` | 受け付ける状態に戻す | `{ "accepting": true }`。何度呼んでも同じ |
+
+受け付けているかは `GET /_control/stream/held` の `accepting` で確かめる（上の「private stream の保留・再送」節の held の応答に足した）。
+
+- **受け付けない間は、`GET /_stream/private` を WebSocket の upgrade の前に HTTP `503` と素の JSON `{"error":"STREAM_REFUSED"}` で断る。** `101` を返さないので、接続は購読者に入らない。upgrade かどうかに関わらず断り、**`426`（upgrade でない GET）より先に判定する**（`HEAD` も本文の無い 503）
+- **切ったまま繋がらない状態を作るときは、「受け付けない」を先に入れてから「切る」**（refuse → disconnect）。この順なら、その間に利用側が繋ぎ直しても 503 で断られる。**逆の順（disconnect → refuse）だと、refuse を入れるまでの間に利用側が繋ぎ直し得る**（その接続は閉じないので、閉じるなら disconnect をもう 1 度呼ぶ）
+- **切っている間の変化は、保留していなければ誰にも届かない。** 接続が 0 本の間、モックはメッセージを作らない（上の「private stream」節の「接続した後の変化だけが届く」）。繋ぎ直した後に届くのは、繋いだ後の変化だけである。**後から届けたいなら、切る前に `POST /_control/stream/hold` し、繋ぎ直してから `POST /_control/stream/release` する**——保留中は接続が 0 本でも溜め、release は送る時点で繋がっている全員へ送る（上の「private stream の保留・再送」節）。繋ぐ前の release は 409 `NO_STREAM_CLIENTS` で断られ、溜めたものは残る。組み合わせのための特例は無い
+- 切っている間も受け付けない間も、互換ルートと `/_control/` は通常どおり通る（状態を変える要求も断らない）
+- 受け付けない状態は private stream の配信元（`src/stream/hub.ts`）のメモリにだけあり、`PaperState` にも状態ファイルにも入らない（`GET /_control/state` にも出ない）。**再起動で消え（受け付ける状態で起動する）、`POST /_control/reset` で受け付ける状態に戻る**（上の「private stream と状態の初期化」節）
+- 状態ファイルに書かないので、書き出しに失敗した後の劣化中も 3 つとも通す（上の「private stream と永続化の失敗」節）。劣化の前に refuse していれば、その 503 は劣化中も効く（`GET /_stream/private` を劣化を理由には断らないのと、refuse で断るのは別の話）
+- 無効時・非ループバックの扱いは他の `/_control/` と同じ（上の「`/_control/`」節・「control のアクセス境界」節）。control が無効なら口が無いので、常に受け付ける
+
+**close code を `1001` にした理由**: 公式の配信は PubNub で、WebSocket の close code は利用側の本番の経路に現れない（上の「private stream」節の「利用側への含意」）。効くのはモック向けの接続層だけなので、本物らしさより、他の切れ方と区別できることを優先した。`1011` は送れなかった接続を閉じるコードと、`1012` は reset（手元の注文の対応表を捨てる合図）と重なる。close frame を送らずに TCP を切る形（クライアントには `1006` に見える）は理由を渡せず、モックの不具合による切断と見分けられない。代償は、`1001` の本来の意味が「サーバが止まる・ページを離れる」で、モックは止まらないこと（計画書 18.2 の決定 35）
+
+**断り方を upgrade の前の HTTP 503 にした理由**: 受けてからすぐ閉じる形だと、利用側の接続層には「繋がった直後に切れた」に見え、close code で表す切断（上の「private stream」節の表）と区別しにくい。upgrade の前に断れば「繋がらなかった」として現れる（計画書 18.2 の決定 35）。本文は `/_control/` の失敗と同じ素の JSON の形（`{"error": ...}`）にし、`426` の `UPGRADE_REQUIRED` と並べた
+
+- **根拠**: 本モック固有（計画書 18.2 の要判断事項 35）
+- **本物との差異**: bitbank API に存在しない口。本物の切断は、いつ・どう切れるかを利用者が選べず、再接続は PubNub の SDK と公式の再接続の手順（`private-stream.md:505-512`）が受け持つ。モックは `/_control/` から叩いたときにだけ切れ、close code は `1001` に固定で、ネットワークの断（close frame の無い切断）や接続ごとの切断は起こせない。受け付けない間の HTTP 503 も PubNub の経路には無い形で、モック向けの接続層だけに効く
+- **推測**: はい
+  - 確認先 **モックの設計判断**: 切断の close code を `1001` に固定し、reason に切った口の名前を入れること
+  - 確認先 **モックの設計判断**: 受け付けない間は upgrade の前に HTTP 503 と素の JSON `{"error":"STREAM_REFUSED"}` で断り、`426` より先に判定すること
+  - 確認先 **モックの設計判断**: 切断で状態・保留・溜めたもの・受け付けるかどうかに触れず、接続が 0 本でも成功にすること
+  - 確認先 **モックの設計判断**: 受け付けない状態をメモリにだけ持って reset で戻し、劣化中も 3 つの口を通すこと
+- **利用側への含意**: 「fail-closed」は refuse → disconnect の順で切り、繋がらない間に踏む（REST の照合と状態を変える要求は通るので、照合が成功したら解除する筋もそのまま踏める）。「再同期」は accept して繋ぎ直した後に、未決の注文を REST（`orders_info`）で照合してから受付を再開する——**切れていた間の変化は、保留していなければ stream では届かない**ので、照合でしか拾えない。切る前に保留して繋ぎ直した後に release すれば、照合の後に切れていた間の古いスナップショットが遅れて届く筋（「単調性」と「終端の優先」で捨てる筋）も踏める。`1001` で切れたら、`1012`（reset）と違って手元の注文の対応表は捨てず、REST で照合して差を埋める。close code と 503 による分岐はモック向けの接続層だけのもので、本番の PubNub の経路には現れない
 
 ### private stream の `asset_update` のキー
 

@@ -47,6 +47,18 @@ export const RESET_CLOSE_CODE = 1012;
 export const RESET_CLOSE_REASON = "state reset by /_control/reset";
 
 /**
+ * `/_control/stream/disconnect` で接続を閉じるコード。**1001（Going Away）**を使う
+ * （`docs/plan-lab-mock.md` 18.2 の決定 35）。
+ *
+ * 公式の配信は PubNub で、close code は利用側の本番の経路に現れない。効くのはモック向けの
+ * 接続層だけなので、本物らしさより他の切れ方と区別できることを優先した——`1009`（大きすぎる
+ * フレーム）・`1011`（送れなかった。`sendTo()`）・`1012`（reset。手元の注文の対応表を捨てる
+ * 合図）のどれとも重ならない。状態は残すので、利用側は対応表を捨てずに REST で照合すればよい。
+ */
+export const DISCONNECT_CLOSE_CODE = 1001;
+export const DISCONNECT_CLOSE_REASON = "disconnected by /_control/stream/disconnect";
+
+/**
  * 保留中に溜めるメッセージの通数の上限（既定）。
  *
  * 上限に達すると、以後の変化は溜めずに「溢れた」印と落とした通数だけを残し、release を断る
@@ -135,6 +147,11 @@ type HoldBuffer = {
  * 入れ替わり・重複・欠落を `/_control/` から起こすための口である。hold の後に作った
  * メッセージは送らずに溜め、release で**どれを・どの順で・何回**送るかを番号の並びで
  * 指定する。モック自身は入れ替えない（`docs/fidelity.md` の「private stream の順序」）。
+ *
+ * **切断（`disconnectAll()` / `refuse()` / `accept()`）** は、状態を残したまま stream を
+ * 切るための口である（`docs/fidelity.md` の「private stream の切断」）。reset と違って状態にも
+ * 保留にも触れない。受け付けるかどうかはここに持つが、断るのは WebSocket の upgrade の前の
+ * HTTP の層（`src/routes/private-stream.ts`）で、hub は `addClient()` で断らない。
  */
 export class PrivateStreamHub {
   private readonly clients = new Set<StreamClient>();
@@ -144,6 +161,8 @@ export class PrivateStreamHub {
   private unsubscribe: (() => void) | null = null;
   /** 保留中の中身。`null` なら保留していない（通常の配信）。 */
   private buffer: HoldBuffer | null = null;
+  /** 新しい接続を受け付けるか。`refuse()` で下ろし、`accept()` と reset で戻す。 */
+  private accepting = true;
   /** 保留中に溜める通数の上限。 */
   readonly holdLimit: number;
 
@@ -184,6 +203,33 @@ export class PrivateStreamHub {
   /** 接続中の購読者の数。 */
   clientCount(): number {
     return this.clients.size;
+  }
+
+  /**
+   * 接続中の全員を `DISCONNECT_CLOSE_CODE`（1001）で閉じて外し、閉じた数を返す。0 人でも投げない。
+   *
+   * **状態・保留・溜めたもの・受け付けるかどうかには触れない**（reset との違い）。切っている間の
+   * 変化は、保留していなければ誰にも届かない（購読者が 0 人の間はメッセージを作らない）。
+   * 後から届けたいなら、切る前に `hold()` して、繋ぎ直してから `release()` する。
+   * 切ったまま繋がらない状態を保ちたいなら、**先に `refuse()` する**（後だと、その間に繋ぎ直され得る）。
+   */
+  disconnectAll(): number {
+    return this.closeAll(DISCONNECT_CLOSE_CODE, DISCONNECT_CLOSE_REASON);
+  }
+
+  /** 新しい接続を受け付けない状態にする。既にそうなら何もしない。今の接続は閉じない。 */
+  refuse(): void {
+    this.accepting = false;
+  }
+
+  /** 新しい接続を受け付ける状態に戻す。既にそうなら何もしない。 */
+  accept(): void {
+    this.accepting = true;
+  }
+
+  /** 新しい接続を受け付けるか。既定と reset の後は `true`。 */
+  isAccepting(): boolean {
+    return this.accepting;
   }
 
   /**
@@ -254,14 +300,17 @@ export class PrivateStreamHub {
   }
 
   /**
-   * store の差し替え 1 回を受け取る。reset なら溜めたものを捨てて保留を解き、全員を閉じる。
-   * それ以外は差からメッセージを作って配信方針を通し、保留中なら溜め、そうでなければ送る。
+   * store の差し替え 1 回を受け取る。reset なら溜めたものを捨てて保留を解き、受け付ける状態に
+   * 戻して全員を閉じる。それ以外は差からメッセージを作って配信方針を通し、保留中なら溜め、
+   * そうでなければ送る。
    */
   private onStateChange(change: StateChange): void {
     if (change.kind === "reset") {
       // reset の前の注文のメッセージを、id を 1 から配り直した後に届けない（接続を閉じる
-      // 理由と同じ）。保留も解くので、前の実験で解き忘れていてもシナリオの冒頭の reset で戻る。
+      // 理由と同じ）。保留も解き、受け付ける状態にも戻すので、前の実験で解き忘れていても
+      // シナリオの冒頭の reset で戻る（`docs/plan-lab-mock.md` 17.2 の決定 21 と 18.2 の決定 35）。
       this.buffer = null;
+      this.accepting = true;
       this.closeAll(RESET_CLOSE_CODE, RESET_CLOSE_REASON);
       return;
     }
@@ -340,8 +389,11 @@ export class PrivateStreamHub {
     }
   }
 
-  /** 全員を閉じて外す（reset のとき）。閉じ損ねても外すので、以後は送らない。 */
-  private closeAll(code: number, reason: string): void {
+  /**
+   * 全員を閉じて外し、外した数を返す（reset と `disconnectAll()`）。閉じ損ねても外すので、
+   * 以後は送らない。数には閉じ損ねた購読者も入る。
+   */
+  private closeAll(code: number, reason: string): number {
     const clients = [...this.clients];
     this.clients.clear();
     for (const client of clients) {
@@ -351,5 +403,6 @@ export class PrivateStreamHub {
         // 閉じ損ねても外してあるので、以後は送らない。
       }
     }
+    return clients.length;
   }
 }

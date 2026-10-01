@@ -1,10 +1,15 @@
 import type { FastifyInstance } from "fastify";
 import { describe, expect, it } from "vitest";
 import WebSocket from "ws";
-import { PRIVATE_STREAM_PATH } from "../../src/routes/private-stream.ts";
+import { PRIVATE_STREAM_PATH, STREAM_REFUSED_BODY } from "../../src/routes/private-stream.ts";
 import type { PrivateStreamMessage } from "../../src/stream/events.ts";
 import type { HeldMessage } from "../../src/stream/hub.ts";
-import { RESET_CLOSE_CODE, RESET_CLOSE_REASON } from "../../src/stream/hub.ts";
+import {
+  DISCONNECT_CLOSE_CODE,
+  DISCONNECT_CLOSE_REASON,
+  RESET_CLOSE_CODE,
+  RESET_CLOSE_REASON,
+} from "../../src/stream/hub.ts";
 import { buildState } from "../engine/helpers.ts";
 import { connectStream, setupBuildTestServer, streamRecorder } from "./helpers.ts";
 import { OFFICIAL_STREAM_ORDER_STATUSES } from "./official-fields.ts";
@@ -360,6 +365,186 @@ describe("GET /_stream/private と保留・再送", () => {
       status: "UNFILLED",
     });
     ws.terminate();
+  });
+});
+
+/**
+ * 切断（`/_control/stream/disconnect`）と、新しい接続を受け付けない状態（`/_control/stream/refuse`・
+ * `/_control/stream/accept`）を WebSocket 越しに見る。利用側の「fail-closed」と「再同期」を、
+ * stream が**切れる**形で踏むための口（`docs/fidelity.md` の「private stream の切断」節）。
+ */
+describe("GET /_stream/private と切断", () => {
+  const build = setupBuildTestServer();
+
+  async function setup() {
+    const { fastify } = await build(buildState(), {}, { fillMode: "manual", controlEnabled: true });
+    const post = (url: string, payload?: Record<string, unknown>) =>
+      fastify.inject({ method: "POST", url, ...(payload === undefined ? {} : { payload }) });
+    const orderOf = async (orderId: number) =>
+      (await post("/v1/user/spot/orders_info", { pair: "btc_jpy", order_ids: [orderId] })).json()
+        .data.orders[0];
+    const accepting = async () =>
+      (await fastify.inject({ method: "GET", url: "/_control/stream/held" })).json().accepting;
+    return { fastify, post, orderOf, accepting };
+  }
+
+  it("disconnect で 1001 と reason が届き、注文は REST の照合で見えたまま残る", async () => {
+    const { fastify, post, orderOf } = await setup();
+    const { ws, ...rec } = await connectStream(fastify);
+    const placed = await post("/v1/user/spot/order", LIMIT_BUY);
+    const orderId = placed.json().data.order_id as number;
+    await rec.flush();
+    rec.take();
+
+    const res = await post("/_control/stream/disconnect");
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ closed: 1 });
+    expect(await rec.closed).toEqual({
+      code: DISCONNECT_CLOSE_CODE,
+      reason: DISCONNECT_CLOSE_REASON,
+    });
+    expect(rec.messages).toEqual([]);
+    expect(fastify.privateStream.clientCount()).toBe(0);
+
+    // reset と違って状態は残る（注文 id も配り直さない）。
+    expect(await orderOf(orderId)).toMatchObject({ order_id: orderId, status: "UNFILLED" });
+    // 接続が 0 本でも成功にする（失うものが無い）。
+    const again = await post("/_control/stream/disconnect");
+    expect(again.statusCode).toBe(200);
+    expect(again.json()).toEqual({ closed: 0 });
+    ws.terminate();
+  });
+
+  it("hold → disconnect → 変化 → 繋ぎ直す → release で、切っていた間の変化が届く", async () => {
+    const { fastify, post, orderOf } = await setup();
+    const first = await connectStream(fastify);
+    await post("/v1/user/spot/order", LIMIT_BUY);
+    await first.flush();
+    first.take();
+
+    await post("/_control/stream/hold");
+    await post("/_control/stream/disconnect");
+    expect((await first.closed).code).toBe(DISCONNECT_CLOSE_CODE);
+    // 切っている間の全量約定。接続は 0 本だが、保留中なので溜まる。
+    expect((await post("/_control/orders/1/fill")).statusCode).toBe(200);
+    // 繋ぐ前の release は断られ、溜めたものは残る。
+    expect((await post("/_control/stream/release")).statusCode).toBe(409);
+
+    const { ws, ...rec } = await connectStream(fastify);
+    await rec.flush();
+    expect(rec.messages).toEqual([]);
+    const res = await post("/_control/stream/release");
+    expect(res.json()).toEqual({ sent: 4, omitted: [], clients: 1 });
+    await rec.flush();
+    expect(rec.methods()).toEqual(["spot_order", "spot_trade", "asset_update", "asset_update"]);
+    const streamed = rec.messages[0]?.message.params[0] as Record<string, unknown>;
+    expect(streamed).toMatchObject({ order_id: 1, status: "FULLY_FILLED" });
+    // 届いた注文は同じ時点の REST の照合と一致する。
+    const { executed_at, is_just_triggered, ...rest } = streamed;
+    expect(rest).toEqual(await orderOf(1));
+    expect(first.messages).toEqual([]);
+    ws.terminate();
+  });
+
+  it("refuse の間は upgrade を 503 で断り、accept の後は繋がる", async () => {
+    const { fastify, post, accepting } = await setup();
+    const refuse = await post("/_control/stream/refuse");
+    expect(refuse.statusCode).toBe(200);
+    expect(refuse.json()).toEqual({ accepting: false });
+    expect(await accepting()).toBe(false);
+
+    await fastify.ready();
+    await expect(fastify.injectWS(PRIVATE_STREAM_PATH)).rejects.toThrow(
+      "Unexpected server response: 503",
+    );
+    expect(fastify.privateStream.clientCount()).toBe(0);
+    // upgrade でない GET も 503（426 より先に判定する）。本文は素の JSON。
+    const plain = await fastify.inject({ method: "GET", url: PRIVATE_STREAM_PATH });
+    expect(plain.statusCode).toBe(503);
+    expect(plain.json()).toEqual(STREAM_REFUSED_BODY);
+    expect(STREAM_REFUSED_BODY).toEqual({ error: "STREAM_REFUSED" });
+
+    const accept = await post("/_control/stream/accept");
+    expect(accept.json()).toEqual({ accepting: true });
+    expect(await accepting()).toBe(true);
+    const { ws, ...rec } = await connectStream(fastify);
+    await post("/v1/user/spot/order", LIMIT_BUY);
+    await rec.flush();
+    expect(rec.methods()).toEqual(["spot_order_new", "asset_update"]);
+    // 受け付ける状態に戻ったので、upgrade でない GET は 426 に戻る。
+    const upgradeRequired = await fastify.inject({ method: "GET", url: PRIVATE_STREAM_PATH });
+    expect(upgradeRequired.statusCode).toBe(426);
+    ws.terminate();
+  });
+
+  it("refuse → disconnect の順なら切ったまま繋がらず、その間も REST の照合と発注は通る", async () => {
+    const { fastify, post, orderOf } = await setup();
+    const first = await connectStream(fastify);
+    await post("/_control/stream/refuse");
+    // refuse は今の接続を閉じない。
+    await post("/v1/user/spot/order", LIMIT_BUY);
+    await first.flush();
+    expect(first.methods()).toEqual(["spot_order_new", "asset_update"]);
+
+    expect((await post("/_control/stream/disconnect")).json()).toEqual({ closed: 1 });
+    expect((await first.closed).code).toBe(DISCONNECT_CLOSE_CODE);
+    // 利用側がすぐ繋ぎ直そうとしても断られる。
+    await expect(fastify.injectWS(PRIVATE_STREAM_PATH)).rejects.toThrow(
+      "Unexpected server response: 503",
+    );
+
+    // 切れている間の発注。保留していないので、stream には誰にも届かない。
+    const placed = await post("/v1/user/spot/order", LIMIT_BUY);
+    expect(placed.json().success).toBe(1);
+    const orderId = placed.json().data.order_id as number;
+    expect(await orderOf(orderId)).toMatchObject({ order_id: orderId, status: "UNFILLED" });
+
+    await post("/_control/stream/accept");
+    const { ws, ...rec } = await connectStream(fastify);
+    await rec.flush();
+    // 切れていた間の変化は届かない。拾うのは REST の照合（再同期）。
+    expect(rec.messages).toEqual([]);
+    ws.terminate();
+  });
+
+  it("refuse の後に reset すると、受け付ける状態に戻る", async () => {
+    const { fastify, post, accepting } = await setup();
+    await post("/_control/stream/refuse");
+    expect((await post("/_control/reset", {})).statusCode).toBe(200);
+    expect(await accepting()).toBe(true);
+    const { ws, ...rec } = await connectStream(fastify);
+    await post("/v1/user/spot/order", LIMIT_BUY);
+    await rec.flush();
+    expect(rec.methods()).toEqual(["spot_order_new", "asset_update"]);
+    ws.terminate();
+  });
+
+  /** `injectWS()` は応答の本文を読めないので、本物の upgrade の要求で 503 の本文まで見る。 */
+  it("実際に listen したサーバへの upgrade も、HTTP 503 と素の JSON で断る", async () => {
+    const { fastify, post } = await setup();
+    await post("/_control/stream/refuse");
+    await fastify.listen({ port: 0, host: "127.0.0.1" });
+    const address = fastify.server.address();
+    if (address === null || typeof address === "string") throw new Error("listen していない");
+    const ws = new WebSocket(`ws://127.0.0.1:${address.port}${PRIVATE_STREAM_PATH}`);
+    const refused = await new Promise<{ status?: number; type?: string; body: string }>(
+      (resolve, reject) => {
+        ws.once("open", () => reject(new Error("繋がってしまった")));
+        ws.once("unexpected-response", (_req, res) => {
+          let body = "";
+          res.on("data", (chunk) => {
+            body += chunk;
+          });
+          res.on("end", () =>
+            resolve({ status: res.statusCode, type: res.headers["content-type"], body }),
+          );
+        });
+      },
+    );
+    expect(refused.status).toBe(503);
+    expect(refused.type).toMatch(/^application\/json/);
+    expect(JSON.parse(refused.body)).toEqual(STREAM_REFUSED_BODY);
+    expect(fastify.privateStream.clientCount()).toBe(0);
   });
 });
 

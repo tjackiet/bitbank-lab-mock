@@ -18,8 +18,9 @@ export type PersistFailureMode = "degrade" | "ignore";
  *
  * **private stream の 2 経路も読み取りに入れる。** `GET /v1/user/subscribe` は固定の値を
  * 返すだけで、`GET /_stream/private` は状態を読み出して送るだけである。劣化中は状態が
- * 動かないので stream には何も流れないが、接続そのものは断らない（読み取りを生かす、という
- * 劣化モードの約束に揃える）。
+ * 動かないので stream には何も流れないが、接続そのものは劣化を理由に断らない（読み取りを
+ * 生かす、という劣化モードの約束に揃える）。`POST /_control/stream/refuse` の後の 503 は
+ * 劣化と関係なく、劣化中も同じように効く。
  */
 export const READ_ROUTES: ReadonlySet<string> = new Set([
   "GET /v1/user/spot/order",
@@ -66,6 +67,10 @@ export const MUTATING_ROUTES: ReadonlySet<string> = new Set([
  * - **REST の障害注入**（`src/server/faults.ts` の `FaultInjector`）の 4 つ。劣化中に通すのは、
  *   劣化の前に登録した故障を見て取り消せるようにするため（`docs/plan-lab-mock.md` 18.2 の決定 34）。
  *   断ると、読み取りの口に登録した故障が劣化中の照合に当たり続ける
+ * - **private stream の切断**（`PrivateStreamHub` の `disconnectAll()` / `refuse()` / `accept()`）の
+ *   3 つ。劣化中に通すのは、劣化の前に refuse した stream を accept で戻せるようにするため
+ *   （`docs/plan-lab-mock.md` 18.2 の決定 35）。断ると、劣化中も通す読み取りの `GET /_stream/private`
+ *   が、復帰の手順（再起動）まで 503 のまま残る
  *
  * 載せてよいのは `/_control/` の経路だけ（`tests/server/degraded.test.ts` が見る）。
  */
@@ -73,6 +78,9 @@ export const NON_PERSISTING_CONTROL_ROUTES: ReadonlySet<string> = new Set([
   "POST /_control/stream/hold",
   "GET /_control/stream/held",
   "POST /_control/stream/release",
+  "POST /_control/stream/disconnect",
+  "POST /_control/stream/refuse",
+  "POST /_control/stream/accept",
   "POST /_control/faults",
   "GET /_control/faults",
   "DELETE /_control/faults",

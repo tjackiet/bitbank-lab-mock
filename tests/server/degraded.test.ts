@@ -263,6 +263,45 @@ describe("劣化モード（persist に失敗した後）", () => {
     }
   });
 
+  /**
+   * private stream の切断の 3 つも状態ファイルに書かないので劣化中も通す。劣化の前に refuse した
+   * stream を accept で戻せないと、劣化中も通す読み取りの `GET /_stream/private` が、復帰の手順
+   * （再起動）まで 503 のまま残る（`docs/plan-lab-mock.md` 18.2 の決定 35）。
+   */
+  it("劣化中も disconnect / refuse / accept は通る", async () => {
+    const { fastify, store, close } = await buildDegradable();
+    try {
+      const refuse = await fastify.inject({ method: "POST", url: "/_control/stream/refuse" });
+      expect(refuse.json()).toEqual({ accepting: false });
+      await expect(connectStream(fastify)).rejects.toThrow("Unexpected server response: 503");
+      await degrade(store);
+
+      // 受け付けない状態は劣化の前のまま残る（劣化を理由には断らないが、refuse は効く）。
+      const refused = await fastify.inject({ method: "GET", url: "/_stream/private" });
+      expect(refused.statusCode).toBe(503);
+      expect(refused.json()).toEqual({ error: "STREAM_REFUSED" });
+
+      const accept = await fastify.inject({ method: "POST", url: "/_control/stream/accept" });
+      expect(accept.statusCode).toBe(200);
+      expect(accept.json()).toEqual({ accepting: true });
+      const stream = await connectStream(fastify);
+      expect(fastify.privateStream.clientCount()).toBe(1);
+
+      const again = await fastify.inject({ method: "POST", url: "/_control/stream/refuse" });
+      expect(again.statusCode).toBe(200);
+      const disconnect = await fastify.inject({
+        method: "POST",
+        url: "/_control/stream/disconnect",
+      });
+      expect(disconnect.statusCode).toBe(200);
+      expect(disconnect.json()).toEqual({ closed: 1 });
+      expect((await stream.closed).code).toBe(1001);
+      expect(store.isDegraded()).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
   it("劣化中に読み出した /_control/state を書き戻して読み込める（復帰手順）", async () => {
     const { fastify, store, close } = await buildDegradable();
     try {

@@ -1532,7 +1532,7 @@ id 順（`trade_history` の既定の `desc` なら id の逆順）になるは�
 
 本節は、これに合わせて Plan A の範囲を変える理由（18.1）と、実装の前に決めることを要判断事項 29 以降として
 記録する（18.2）。**要判断事項は 2026-09-30 にすべて決めた**（各項目の「決定」。30 は案から変えた）。PR の分け方は 18.3、
-入れないものは 18.4、決定 29〜34・36 が PR D に送っていた細部を D で決めた記録は 18.5 にある。**`src/` と `tests/` は 1 行も触っていない。** README と `docs/fidelity.md` は、
+入れないものは 18.4、決定 29〜34・36 が PR D に送っていた細部を D で決めた記録は 18.5、決定 35 が PR E に送っていた細部を E で決めた記録は 18.6 にある。**`src/` と `tests/` は 1 行も触っていない。** README と `docs/fidelity.md` は、
 それぞれの実装 PR が挙動と同時に直す。
 
 ### 18.1 範囲を変える理由
@@ -1842,3 +1842,21 @@ upgrade の前に HTTP 503 と素の JSON で断る。**
 | 登録の `id` | プロセスの寿命のあいだ 1 から増え続け、reset でも振り直さない | reset の前に控えた `id` で、reset の後の別の登録を取り消さないため |
 | control が無効なとき | 口だけでなく、互換ルートのフックも掛けない | 故障が起きる経路を構造的に無くす（登録できない以上、フックは要らない） |
 | 当たったことの記録 | 当たるたびに info のログを 1 行（`fault injected: <kind>`） | `no_response` はアクセスログに完了の行が出ず、何が起きたかが残らないため |
+
+### 18.6 PR E で決めたこと（stream の切断の細部）
+
+18.2 の決定 35 が PR E に送っていた細部を、PR E で次のとおり決めた。**18.2 の本文は書き換えない**
+（決める前の記録として残す）。挙動の正は `docs/fidelity.md` の「private stream の切断」節で、ここは索引である。
+
+| 論点 | 決めたこと | 理由 |
+|---|---|---|
+| 口の形（決定 35） | `POST /_control/stream/disconnect`（応答 `{ closed }`）、`POST /_control/stream/refuse` と `POST /_control/stream/accept`（応答 `{ accepting }`）。3 つとも本文は読まない | 保留・再送の口（`/_control/stream/hold` など）に並べた。受け付けない・受け付けるを 1 つの口の本文で切り替えず 2 つに分けたのは、hold と同じく本文を読まない口にして、本文の検査を要らなくするため |
+| 接続が 0 本の disconnect | 200 `{ "closed": 0 }` | 失うものが無い。release の 409 `NO_STREAM_CLIENTS` は溜めたものが誰にも届かずに消えるのを防ぐためのもので、ここには当たらない |
+| refuse / accept を重ねて呼んだとき | 何度呼んでも同じ応答（`{ "accepting": false }` / `{ "accepting": true }`）。既にその状態でも断らない | hold と同じ。テストが状態を確かめずに呼べる |
+| reason の文字列（決定 35） | `disconnected by /_control/stream/disconnect` | reset の `state reset by /_control/reset` と同じ形（何が起きたか + 切った口） |
+| 受け付けているかを確かめる手段 | `GET /_control/stream/held` の応答に `accepting` を足した。`POST /_control/stream/hold` の応答には足さない | 確かめる口を別に作らず、stream の実験の様子（保留と受付）を 1 回で読めるようにした。hold の応答は保留の状況（`HoldStatus`）のまま |
+| 503 の本文（決定 35） | 素の JSON `{"error":"STREAM_REFUSED"}` | `/_control/` の失敗、426 の `{"error":"UPGRADE_REQUIRED"}` と同じ形 |
+| 503 と 426 の順 | 受け付けない間は upgrade かどうかに関わらず 503（426 より先に判定する）。`HEAD` も本文の無い 503 | 受け付けない間に「upgrade すれば繋がる」と読める応答を返さない |
+| 503 を返す場所 | `GET /_stream/private` のルートの `preHandler`（ハンドラの直前）。`@fastify/websocket` はハンドラの中で upgrade するので、`101` を書かずに 503 を書く | 判定から購読者に入るまでの間に I/O を待つところを残さない（その間に refuse の要求が割り込めない）。劣化の判定（ルートの外の `preHandler`）が先に走るが、この口は劣化中も通す読み取りなので順は効かない |
+| 受け付けない状態の持ち主 | `PrivateStreamHub`（`src/stream/hub.ts`）が持ち、reset の通知（`onStateChange()`）で戻す。断るのはルートで、hub の `addClient()` は断らない | 保留と同じ持ち主にすると、reset で戻す処理が 1 か所で済む。hub は WebSocket の実装から切り離してあるので、HTTP の応答はルートが返す |
+| close code の一覧 | `docs/fidelity.md` の「private stream」節に、モックが接続を切る場合（`1001` / `1009` / `1011` / `1012`）の表と、プロセスを止めるときの `1005` を足した | 決定 35 の表を、利用側が読む側に置いた。`1011` とプロセスを止めるときの閉じ方は、これまで `docs/fidelity.md` に無かった |

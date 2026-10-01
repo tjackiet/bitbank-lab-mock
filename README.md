@@ -106,9 +106,11 @@ node -e 'const ws = new WebSocket("ws://127.0.0.1:14000/_stream/private"); ws.on
 - **`GET /v1/user/subscribe` の `pubnub_channel` / `pubnub_token` はダミーです。** 接続では見ません。期限切れも起きません
 - **いつ届くかはモック固有です。** `manual` モードでは互換ルートの発注・取消と `/_control/` の操作でだけ届きます。`market` モードでは誰かが互換ルートを叩いたとき（読み取りでも）に約定とイベントが起きます（control を有効にしていれば `/_control/` の fill / tick でも起きます）。**ただし `GET /v1/user/subscribe` だけは状態を読まないので、叩いても約定は進みません**。裏で市場を見張ってはいないので、**何も叩かなければ何も届きません**
 - **HTTP の応答より先に届くことがあります。** 状態がメモリに反映された直後に送るためで、書き出しに失敗して `70001` を返した発注のイベントも流れます
-- **`POST /_control/reset` は接続を close code `1012` で閉じます。** reset で注文 id が 1 から配り直されるためです。繋ぎ直して、手元の注文の対応表を REST で取り直してください。保留中なら溜めたものも捨て、保留を解きます
+- **`POST /_control/reset` は接続を close code `1012` で閉じます。** reset で注文 id が 1 から配り直されるためです。繋ぎ直して、手元の注文の対応表を REST で取り直してください。保留中なら溜めたものも捨て、保留を解きます。新しい接続を受け付けない状態（下の refuse）も戻します
+- **`POST /_control/stream/disconnect` は、状態を残したまま接続を close code `1001` で閉じます。** 注文も id も残るので、対応表は捨てずに REST で照合して差を埋めてください。**切っている間の変化は、保留していなければ届きません**（繋いだ後の変化だけが届きます）。後から届けたいときは、切る前に hold し、繋ぎ直してから release します（下の「[`/_control/`](#_control)」節）
+- **`POST /_control/stream/refuse` の後は、新しい接続を HTTP `503`（`{"error":"STREAM_REFUSED"}`）で断ります。** upgrade の前に断るので繋がりません。`POST /_control/stream/accept` か reset で戻ります
 - **モックは順序を入れ替えません。** 入れ替わり・重複・欠落は `/_control/stream/*` の保留・再送で起こします（下の「[`/_control/`](#_control)」節）。**保留の後に繋いだ接続にも、release で繋ぐ前の変化が届きます**（「接続した後の変化だけが届く」の例外）
-- クライアントから送ったものは読みません（1024 バイトを超えるフレームは close code `1009` で閉じます）。upgrade でない `GET /_stream/private` には `426` を返します
+- クライアントから送ったものは読みません（1024 バイトを超えるフレームは close code `1009` で閉じます）。upgrade でない `GET /_stream/private` には `426` を返します（受け付けない間は `503` が先です）
 
 どこまで本物と同じか・どこを推測で決めたかは [`docs/fidelity.md`](docs/fidelity.md) の「[private stream](docs/fidelity.md#private-stream)」節から始まる一連の節にあります。
 
@@ -168,7 +170,7 @@ Error: paper state violates invariants: 6 violation(s): 1: order 1 executedAmoun
 
 v1 / v2 の状態ファイルを v3 へ移行した結果が不変量を破っている場合だけは、起動を止めずに warn を出します（`migrated paper state violates invariants: ...`）。
 
-**書き出しに一度でも失敗すると、以後は状態を変える要求を断ります**（v0.1.0 からの変更）。発注・取消・`/_control/` の fill / reject / tick / clock / reset は断り、照会（`GET order` / `orders_info` / `active_orders` / `trade_history` / `assets` / `GET /_control/state`）は今までどおり通します。状態ファイルに書かない `/_control/stream/*`（private stream の保留・再送）と `/_control/faults`（REST の障害注入）も通します。失敗したシナリオを読み出せるようにするためです。断り方は互換ルートが封筒の `70001`、`/_control/` が 503 `PERSIST_DEGRADED` です。
+**書き出しに一度でも失敗すると、以後は状態を変える要求を断ります**（v0.1.0 からの変更）。発注・取消・`/_control/` の fill / reject / tick / clock / reset は断り、照会（`GET order` / `orders_info` / `active_orders` / `trade_history` / `assets` / `GET /_control/state`）は今までどおり通します。状態ファイルに書かない `/_control/stream/*`（private stream の保留・再送と切断）と `/_control/faults`（REST の障害注入）も通します。失敗したシナリオを読み出せるようにするためです。断り方は互換ルートが封筒の `70001`、`/_control/` が 503 `PERSIST_DEGRADED` です。
 
 **復帰は再起動です。** ディスクを直す → `GET /_control/state` でシナリオを読み出す → 再起動、の順で進めてください。劣化中は市場モードの自動約定も止まります（読むたびにメモリだけ進んで状態ファイルとの差が開くのを避けるため）。
 
@@ -188,11 +190,14 @@ bitbank API には存在しません。本番クライアントから叩かな�
 | `POST` | `/_control/orders/:order_id/reject` | 指定注文を `REJECTED` にする（`UNFILLED` / `INACTIVE` のときだけ。部分約定済みは 409）。拘束が外れ、private stream には `REJECTED` の `spot_order` が流れる |
 | `POST` | `/_control/tick` | `{ pair, price }` または `{ pair, candle }` で人工の足を 1 本適用 |
 | `POST` | `/_control/clock` | 時計（`lastTickAt`）を動かす。本文省略で現在時刻（仮想時計では 400）、`{ lastTickAt }` に ISO 文字列かエポックミリ秒、`{ advanceMs }` にいまの時計から進めるミリ秒（1 回で 24 時間まで）。注文・約定・残高は残る（`updatedAt` は書き込み時刻として動きます） |
-| `POST` | `/_control/reset` | 状態を初期化（private stream の接続は close code `1012` で閉じ、保留中なら溜めたものを捨てて保留を解く） |
+| `POST` | `/_control/reset` | 状態を初期化（private stream の接続は close code `1012` で閉じ、保留中なら溜めたものを捨てて保留を解き、受け付けない状態も戻す） |
 | `GET` | `/_control/state` | `PaperState` に、状態ファイルへの書き出しの状況（`persist`）と足の取得の状況（`candles`）を添えて返す（仮想時計のときは `clock: { mode: "virtual" }` も） |
 | `POST` | `/_control/stream/hold` | private stream の保留を始める。以後の変化のメッセージは送らずに溜める（接続が 0 本でも溜める） |
-| `GET` | `/_control/stream/held` | 保留の状況と、溜めたメッセージを溜めた順に番号（`seq`、1 から）付きで返す |
+| `GET` | `/_control/stream/held` | 保留の状況と、溜めたメッセージを溜めた順に番号（`seq`、1 から）付きで返す。新しい接続を受け付けているか（`accepting`）も返す |
 | `POST` | `/_control/stream/release` | `{ order: [番号, ...] }` の順に、その時点で接続している全員へ送って保留を解く。`order` 省略は溜めた順にすべて。送るものがあるのに接続が 0 本なら 409（溜めたものは残る） |
+| `POST` | `/_control/stream/disconnect` | private stream の接続をすべて close code `1001` で閉じ、閉じた数を `{ closed }` で返す（0 本でも 200）。状態・保留・溜めたものは残す |
+| `POST` | `/_control/stream/refuse` | 新しい接続を受け付けない状態にする（`GET /_stream/private` が upgrade の前に 503 になる）。今の接続は閉じない |
+| `POST` | `/_control/stream/accept` | 受け付ける状態に戻す |
 | `POST` | `/_control/faults` | `{ method, path, kind, count?, status? }` で、互換ルートの「次の `count` 回（既定 1）の（メソッド, パス）」に故障を登録する。`kind` は `rate_limit`（429）/ `server_error`（5xx）/ `no_response`（応答不明）/ `server_error_after_apply`（状態を変えたうえで 5xx） |
 | `GET` | `/_control/faults` | 登録した故障を登録した順に返す（`remaining` と `hits`。使い切った登録も残る） |
 | `DELETE` | `/_control/faults/:id` | 1 件取り消す |
@@ -211,6 +216,20 @@ curl -s -X POST localhost:14000/_control/stream/release -H 'content-type: applic
 接続が 1 本も無いときの release は、溜めたものが誰にも届かずに消えないよう 409 `NO_STREAM_CLIENTS` で断ります（保留も溜めたものも残ります）。溜めたものを捨てたいときは `{"order":[]}` で release してください。
 
 溜めるのは 10,000 通までです。超えた後の変化は溜めずに `overflowed` と `dropped`（落とした通数）を残し、以後の release は 409 で断ります（発注などの状態を変える要求は断りません）。抜け出すのは `POST /_control/reset` です。溜めたものはメモリにだけあり、再起動で消えます。細則は [`docs/fidelity.md`](docs/fidelity.md) の「private stream の保留・再送」の節にあります。
+
+**private stream の切断は、disconnect / refuse / accept で起こします。** reset と違って状態は残ります。**切ったまま繋がらない時間を作るときは、refuse を先に入れてから disconnect します**——逆の順だと、refuse を入れるまでの間に利用側が繋ぎ直せてしまいます。切っている間の変化は、保留していなければ誰にも届きません。後から届けたいときは、切る前に hold し、繋ぎ直してから release します。
+
+```bash
+curl -s -X POST localhost:14000/_control/stream/hold        # 切っている間の変化も溜める（後から届けないなら要らない）
+curl -s -X POST localhost:14000/_control/stream/refuse      # 先に、新しい接続を 503 で断る状態にする
+curl -s -X POST localhost:14000/_control/stream/disconnect  # 接続を 1001 で閉じる → {"closed":1}
+# ……切れている間に約定・取消を起こす。互換ルートの照合（orders_info など）は通る……
+curl -s -X POST localhost:14000/_control/stream/accept      # 受け付ける状態に戻す
+# ……利用側が繋ぎ直す……
+curl -s -X POST localhost:14000/_control/stream/release     # 切っていた間の変化を届ける
+```
+
+受け付けない状態はメモリにだけあり、`POST /_control/reset` と再起動で受け付ける状態に戻ります。細則は [`docs/fidelity.md`](docs/fidelity.md) の「private stream の切断」の節にあります。
 
 **REST の 429・5xx・応答不明は、`/_control/faults` で起こします。** 互換ルートの（メソッド, パス）ごとに、次の何回にどの故障を起こすかを登録します。同じ（メソッド, パス）に複数登録すると、登録した順に使い切ります。乱数も時間も使わないので、同じシナリオは毎回同じ結果になります。
 
@@ -250,14 +269,14 @@ curl -s -X POST localhost:14000/_control/clock -H 'content-type: application/jso
 
 成行だけは価格を実時刻の窓で取り、記録する時刻だけを仮想にします（約定価格はその仮想時刻の市場価格ではありません）。細則は [`docs/fidelity.md`](docs/fidelity.md) の「仮想時計」の節にあります。
 
-無効時は 404。非ループバックはトークンが一致しない限り 403 です。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が 503 `PERSIST_DEGRADED` になります（`GET /_control/state` と、状態ファイルに書かない `stream/hold` / `stream/held` / `stream/release` / `faults` は通ります）。**ループバックからはトークン無しで通る**ので、同一ホスト上の他プロセスからの誤操作は防げません。接続元の判定には TCP の対向アドレスだけを使い、`X-Forwarded-For` は見ません（Fastify の `trustProxy` の設定に境界は左右されません。ただし判定を `request.ip` に変えると、`trustProxy` を有効にした瞬間にヘッダの詐称で迂回できるようになります）。`X-Control-Token` はヘッダ行がちょうど 1 本のときだけ受け付けます。
+無効時は 404。非ループバックはトークンが一致しない限り 403 です。状態ファイルへの書き出しに失敗した後は、状態を変える口（`fill` / `reject` / `tick` / `clock` / `reset`）が 503 `PERSIST_DEGRADED` になります（`GET /_control/state` と、状態ファイルに書かない `stream/hold` / `stream/held` / `stream/release` / `stream/disconnect` / `stream/refuse` / `stream/accept` / `faults` は通ります）。**ループバックからはトークン無しで通る**ので、同一ホスト上の他プロセスからの誤操作は防げません。接続元の判定には TCP の対向アドレスだけを使い、`X-Forwarded-For` は見ません（Fastify の `trustProxy` の設定に境界は左右されません。ただし判定を `request.ip` に変えると、`trustProxy` を有効にした瞬間にヘッダの詐称で迂回できるようになります）。`X-Control-Token` はヘッダ行がちょうど 1 本のときだけ受け付けます。
 
 ## 非目標（Plan A）
 
 - 公式 testnet / 動作保証 / 全 error code の網羅
 - 認証ヘッダの検証、回数を数えるレート制限（429 の注入はできます）、注文訂正
 - ダッシュボード、public REST の網羅、PubNub での配信
-- 障害注入のうち、時間で遅らせる注入・乱数での注入と、private stream の接続ごとの注入（REST の 429・5xx・応答不明は `/_control/faults` で、private stream の重複・順序入替・欠落は `/_control/stream/*` の保留・再送で起こせます）
+- 障害注入のうち、時間で遅らせる注入・乱数での注入と、private stream の接続ごとの注入（REST の 429・5xx・応答不明は `/_control/faults` で、private stream の重複・順序入替・欠落は `/_control/stream/*` の保留・再送で、切断は全接続まとめて `/_control/stream/disconnect` で起こせます）
 
 計画の詳細は [`docs/plan-lab-mock.md`](docs/plan-lab-mock.md) です。
 

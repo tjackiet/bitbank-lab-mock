@@ -1106,6 +1106,7 @@ describe("/_control/stream", () => {
       limit: DEFAULT_HOLD_LIMIT,
       overflowed: false,
       dropped: 0,
+      accepting: true,
       messages: [],
     });
   });
@@ -1263,6 +1264,95 @@ describe("/_control/stream", () => {
       const res = await fastify.inject({ method, url });
       expect(res.statusCode).toBe(404);
     }
+  });
+
+  describe("切断（disconnect / refuse / accept）", () => {
+    it("disconnect は接続をすべて閉じて閉じた数を返し、0 本でも 200。保留と溜めたものは残す", async () => {
+      const { fastify, order, held } = await setup();
+      // setup() が足した購読者に 1 人足して 2 人にする。
+      const closed: Array<[number, string]> = [];
+      fastify.privateStream.addClient({
+        send: () => {},
+        close: (code, reason) => closed.push([code, reason]),
+      });
+      await fastify.inject({ method: "POST", url: "/_control/stream/hold" });
+      await order();
+
+      const res = await fastify.inject({ method: "POST", url: "/_control/stream/disconnect" });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ closed: 2 });
+      expect(closed).toEqual([[1001, "disconnected by /_control/stream/disconnect"]]);
+      expect(await held()).toMatchObject({ holding: true, held: 2, accepting: true });
+
+      const none = await fastify.inject({ method: "POST", url: "/_control/stream/disconnect" });
+      expect(none.statusCode).toBe(200);
+      expect(none.json()).toEqual({ closed: 0 });
+    });
+
+    it("refuse と accept は何度呼んでも同じ応答で、held の accepting に出る", async () => {
+      const { fastify, held } = await setup();
+      expect(await held()).toMatchObject({ holding: false, accepting: true });
+      for (let i = 0; i < 2; i++) {
+        const res = await fastify.inject({ method: "POST", url: "/_control/stream/refuse" });
+        expect(res.statusCode).toBe(200);
+        expect(res.json()).toEqual({ accepting: false });
+      }
+      expect(await held()).toMatchObject({ accepting: false });
+      // 受け付けないのは新しい接続だけ。今の接続（setup() が足した購読者）は残る。
+      expect(fastify.privateStream.clientCount()).toBe(1);
+      for (let i = 0; i < 2; i++) {
+        const res = await fastify.inject({ method: "POST", url: "/_control/stream/accept" });
+        expect(res.statusCode).toBe(200);
+        expect(res.json()).toEqual({ accepting: true });
+      }
+      expect(await held()).toMatchObject({ accepting: true });
+    });
+
+    it("受け付けるかどうかは PaperState にも GET /_control/state にも現れず、reset で受け付ける状態に戻る", async () => {
+      const { fastify, store, held } = await setup();
+      const before = store.state();
+      await fastify.inject({ method: "POST", url: "/_control/stream/refuse" });
+      expect(store.state()).toBe(before);
+      const state = await fastify.inject({ method: "GET", url: "/_control/state" });
+      expect(Object.keys(state.json()).sort()).toEqual(
+        [...Object.keys(before), "persist", "candles"].sort(),
+      );
+      await fastify.inject({ method: "POST", url: "/_control/reset", payload: {} });
+      expect(await held()).toMatchObject({ accepting: true });
+    });
+
+    it.each([
+      { method: "POST", url: "/_control/stream/disconnect" },
+      { method: "POST", url: "/_control/stream/refuse" },
+      { method: "POST", url: "/_control/stream/accept" },
+    ] as const)(
+      "非ループバックからの $method $url はトークンが無ければ 403 で、接続も受け付けるかどうかも変えない",
+      async ({ method, url }) => {
+        const { fastify } = await setup({ token: "secret" });
+        // accept が 403 で何も変えないことを見るため、先に受け付けない状態にしておく。
+        const refusing = url.endsWith("/accept");
+        if (refusing) fastify.privateStream.refuse();
+        const res = await fastify.inject({ method, url, remoteAddress: "10.0.0.8" });
+        expect(res.statusCode).toBe(403);
+        expect(res.json()).toEqual({ error: "FORBIDDEN" });
+        expect(fastify.privateStream.clientCount()).toBe(1);
+        expect(fastify.privateStream.isAccepting()).toBe(!refusing);
+      },
+    );
+
+    it("control を無効にすると 3 つとも 404 で、接続は受け付けたまま", async () => {
+      const { fastify } = await setup({ controlEnabled: false });
+      for (const url of [
+        "/_control/stream/disconnect",
+        "/_control/stream/refuse",
+        "/_control/stream/accept",
+      ]) {
+        const res = await fastify.inject({ method: "POST", url });
+        expect(res.statusCode).toBe(404);
+      }
+      expect(fastify.privateStream.clientCount()).toBe(1);
+      expect(fastify.privateStream.isAccepting()).toBe(true);
+    });
   });
 });
 

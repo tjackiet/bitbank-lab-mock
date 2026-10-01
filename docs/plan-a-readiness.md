@@ -70,7 +70,7 @@
 | 時計の操作 | **一部** | `BITBANK_MOCK_CLOCK=virtual` で起動し、`POST /_control/clock` / `POST /_control/tick` | [仮想時計](fidelity.md#仮想時計) / [control の時計](fidelity.md#control-の時計) |
 | 再起動をまたぐ永続化 | **一部** | 状態ファイル（`BITBANK_MOCK_STATE_PATH`） | [状態の永続化](fidelity.md#状態の永続化) / [壊れた状態ファイル](fidelity.md#壊れた状態ファイル) / [同一状態ファイルの多重起動](fidelity.md#同一状態ファイルの多重起動) |
 | 失敗の見え方（error code と封筒） | **一部** | 互換ルートは封筒、`/_control/` は素の JSON | [エラーコード](fidelity.md#エラーコード) / [封筒に包まれない応答](fidelity.md#封筒に包まれない応答) / [配列の包み方](fidelity.md#配列の包み方) |
-| 注文・約定・残高の変化の push 受信 | **一部** | `GET /_stream/private`（WebSocket）と `GET /v1/user/subscribe` | [private stream](fidelity.md#private-stream) / [private stream のメッセージ](fidelity.md#private-stream-のメッセージ) / [private stream の発火契機](fidelity.md#private-stream-の発火契機) |
+| 注文・約定・残高の変化の push 受信 | **一部** | `GET /_stream/private`（WebSocket）と `GET /v1/user/subscribe`。切断は `POST /_control/stream/disconnect` / `POST /_control/stream/refuse` / `POST /_control/stream/accept` | [private stream](fidelity.md#private-stream) / [private stream のメッセージ](fidelity.md#private-stream-のメッセージ) / [private stream の発火契機](fidelity.md#private-stream-の発火契機) / [private stream の切断](fidelity.md#private-stream-の切断) |
 | push の順序の入れ替わり・重複・欠落を起こす手段 | 対応 | `POST /_control/stream/hold` / `GET /_control/stream/held` / `POST /_control/stream/release` | [private stream の順序](fidelity.md#private-stream-の順序) / [private stream の保留・再送](fidelity.md#private-stream-の保留再送) |
 | 注文を `REJECTED` にする手段 | 対応 | `POST /_control/orders/:order_id/reject` | [注文状態](fidelity.md#注文状態) / [`/_control/`](fidelity.md#_control) / [private stream の注文ペイロード](fidelity.md#private-stream-の注文ペイロード) |
 | REST の 429・5xx・応答不明を起こす手段 | **一部** | `POST /_control/faults` / `GET /_control/faults` / `DELETE /_control/faults/:id` / `DELETE /_control/faults` | [REST の障害注入](fidelity.md#rest-の障害注入) / [レート制限](fidelity.md#レート制限) |
@@ -89,8 +89,11 @@
 - **push 受信** — **PubNub ではなく素の WebSocket** で配信する。market モードでは誰かが互換ルートか `/_control/` の fill / tick を叩いたときにだけ
   約定とイベントが起き（互換ルートのうち `GET /v1/user/subscribe` は状態を読まないので例外で、叩いても約定は進まない）、`POST /_control/reset` は接続を閉じる。**モック自身は順序を入れ替えず、重複も欠落も起こさない**——起こすのは上の表の
   保留・再送（`/_control/stream/*`）で、指定したとおりにしか起きない（時間で遅らせる注入・乱数での注入は無い）。
+  **切断も `/_control/` から起こしたときだけ**で、全接続をまとめて close code `1001` で閉じる（状態は残る）。新しい接続を断る間（refuse）は
+  繋がらない。**切っている間の変化は、保留していなければ届かない**（接続ごとの切断と、close frame の無い切断は起こせない）。
   条件は [`fidelity.md` の「private stream の発火契機」](fidelity.md#private-stream-の発火契機)と
-  [`fidelity.md` の「private stream と状態の初期化」](fidelity.md#private-stream-と状態の初期化)にある
+  [`fidelity.md` の「private stream と状態の初期化」](fidelity.md#private-stream-と状態の初期化)と
+  [`fidelity.md` の「private stream の切断」](fidelity.md#private-stream-の切断)にある
 - **REST の 429・5xx・応答不明** — 起きるのは **`/_control/faults` で登録したときだけ**で、「次の N 回の（メソッド, パス）」に
   指定したとおりにしか起きない（回数を数えるレート制限は無く、ポーリングが枠に収まっているかは確かめられない）。
   **5xx の本文と、実 API がいつ 5xx を返すかは推測**である。条件は
