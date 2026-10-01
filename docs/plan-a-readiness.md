@@ -219,6 +219,8 @@
 
 [`examples/scenario-plan-a.sh`](../examples/scenario-plan-a.sh) を最初に流してほしい。
 発注 → 拘束 → `/_control/` での約定 → 残高の変化までを、`curl` だけで端から端まで通す。
+後半では private stream を切り（refuse → disconnect）、繋がらない間も発注と照合（`orders_info`）が通ることを見てから、
+受け付ける状態に戻す（WebSocket の接続は張らないので、届くメッセージは見ない）。
 **期待した状態に届かなければ終了コード 1 で止まる**ので、出力を目で読む前提になっていない。
 
 前提:
