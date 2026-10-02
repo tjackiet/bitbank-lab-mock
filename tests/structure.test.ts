@@ -79,6 +79,9 @@ const TEST_WITHOUT_SRC: Record<string, string> = {
   "scenarios/example-script.test.ts":
     "`examples/scenario-plan-a.sh` を実プロセスのサーバへ流す。見る対象が src ではなく" +
     "リポジトリに置いた例のスクリプトそのもの",
+  "scenarios/example-mcp-lab.test.ts":
+    "`examples/scenario-mcp-lab.mjs` の、前提が欠けたときに確認を始めず止まる経路を流す。" +
+    "見る対象が src ではなくリポジトリに置いた例のスクリプトそのもの（本体は MCP の checkout が要るので流さない）",
   "network-guard.test.ts":
     "テスト基盤（`tests/network-guard.ts` と `tests/no-network.ts`）の検査。" +
     "外向きの fetch を止める番人が空振りしていないことを見る",
